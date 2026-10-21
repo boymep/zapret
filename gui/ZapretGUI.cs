@@ -889,15 +889,13 @@ namespace ZapretGUI
         ServiceTab serviceTab;
         CheckBox tgCheck;
         Label tgStatus;
-        ToolStripMenuItem trayTgItem, trayAdvancedItem;
+        ToolStripMenuItem trayTgItem;
         bool tgUp;
         readonly object tgLock = new object();
         TabPage mainPage, servicePage;
         Label versionLabel, updateStatus;
         Button updateButton;
-        CheckBox advancedCheck;
         bool updating;
-        bool advanced;
         bool checkUpdates = true;
         readonly bool afterUpdate, resumeAfter;
 
@@ -924,7 +922,6 @@ namespace ZapretGUI
                 BeginInvoke(new MethodInvoker(delegate { Start(); }));
             serviceTab.StartupRefresh();
             TgRefreshAsync();
-            ApplyAdvanced(advanced);
             if (afterUpdate)
             {
                 Log("Обновлено до версии " + Core.LocalVersion());
@@ -1064,37 +1061,6 @@ namespace ZapretGUI
         {
             get { return checkUpdates; }
             set { checkUpdates = value; SaveState(); }
-        }
-
-        // ---------- advanced tabs ----------
-
-        void ApplyAdvanced(bool on)
-        {
-            if (!on)
-            {
-                if (tabs.TabPages.Contains(listsPage) && !listsTab.ConfirmDiscard())
-                {
-                    SyncAdvancedControls(true);
-                    return;
-                }
-                tabs.SelectedTab = mainPage;
-                tabs.TabPages.Remove(listsPage);
-                tabs.TabPages.Remove(servicePage);
-            }
-            else
-            {
-                if (!tabs.TabPages.Contains(listsPage)) tabs.TabPages.Add(listsPage);
-                if (!tabs.TabPages.Contains(servicePage)) tabs.TabPages.Add(servicePage);
-            }
-            advanced = on;
-            SyncAdvancedControls(on);
-            SaveState();
-        }
-
-        void SyncAdvancedControls(bool on)
-        {
-            advancedCheck.Checked = on;
-            trayAdvancedItem.Checked = on;
         }
 
         public void ResetWarp()
@@ -1269,7 +1235,7 @@ namespace ZapretGUI
             AutoScaleDimensions = new SizeF(96f, 96f);
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(640, 720);
-            MinimumSize = new Size(560, 620); // main tab has the update row and the advanced checkbox; keeps the log readable
+            MinimumSize = new Size(560, 600); // main tab has the update row; keeps the log readable
             Padding = new Padding(8);
 
             tabs = new TabControl();
@@ -1305,6 +1271,31 @@ namespace ZapretGUI
             t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             mainPage.Controls.Add(t);
+
+            // Version + update row
+            FlowLayoutPanel ur = new FlowLayoutPanel();
+            ur.AutoSize = true;
+            ur.Dock = DockStyle.Fill;
+            ur.WrapContents = true;
+            ur.Margin = new Padding(0, 0, 0, 6);
+            updateButton = new Button();
+            updateButton.AutoSize = true;
+            updateButton.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            updateButton.Text = "Проверить обновления";
+            updateButton.Padding = new Padding(6, 1, 6, 1);
+            updateButton.Click += delegate { CheckForUpdates(); };
+            versionLabel = new Label();
+            versionLabel.AutoSize = true;
+            versionLabel.Margin = new Padding(8, 8, 3, 3);
+            versionLabel.Text = "Версия " + Core.LocalVersion();
+            updateStatus = new Label();
+            updateStatus.AutoSize = true;
+            updateStatus.ForeColor = Color.DimGray;
+            updateStatus.Margin = new Padding(8, 8, 3, 3);
+            ur.Controls.Add(updateButton);
+            ur.Controls.Add(versionLabel);
+            ur.Controls.Add(updateStatus);
+            AddRow(t, ur, 0);
 
             strategyBox = new ComboBox();
             strategyBox.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -1368,31 +1359,6 @@ namespace ZapretGUI
             tgt.SetColumnSpan(tgHint, 2);
             AddRow(t, tg, 0);
 
-            // Version + update row
-            FlowLayoutPanel ur = new FlowLayoutPanel();
-            ur.AutoSize = true;
-            ur.Dock = DockStyle.Fill;
-            ur.WrapContents = true;
-            ur.Margin = new Padding(0, 4, 0, 0);
-            versionLabel = new Label();
-            versionLabel.AutoSize = true;
-            versionLabel.Margin = new Padding(3, 8, 8, 3);
-            versionLabel.Text = "Версия " + Core.LocalVersion();
-            updateButton = new Button();
-            updateButton.AutoSize = true;
-            updateButton.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            updateButton.Text = "Проверить обновления";
-            updateButton.Padding = new Padding(6, 1, 6, 1);
-            updateButton.Click += delegate { CheckForUpdates(); };
-            updateStatus = new Label();
-            updateStatus.AutoSize = true;
-            updateStatus.ForeColor = Color.DimGray;
-            updateStatus.Margin = new Padding(8, 8, 3, 3);
-            ur.Controls.Add(versionLabel);
-            ur.Controls.Add(updateButton);
-            ur.Controls.Add(updateStatus);
-            AddRow(t, ur, 0);
-
             logBox = new TextBox();
             logBox.Multiline = true;
             logBox.ReadOnly = true;
@@ -1422,10 +1388,6 @@ namespace ZapretGUI
             toggleButton.Margin = new Padding(3, 3, 3, 3);
             toggleButton.Click += delegate { Toggle(); };
             AddRow(t, toggleButton, 64);
-
-            advancedCheck = NewCheck("Расширенные настройки (списки, сервис)");
-            advancedCheck.Click += delegate { ApplyAdvanced(advancedCheck.Checked); };
-            AddRow(t, advancedCheck, 0);
 
             Resize += delegate
             {
@@ -1493,10 +1455,6 @@ namespace ZapretGUI
             trayTgItem.CheckOnClick = true;
             trayTgItem.Click += delegate { tgCheck.Checked = trayTgItem.Checked; };
             trayMenu.Items.Add(trayTgItem);
-            trayAdvancedItem = new ToolStripMenuItem("Расширенные настройки");
-            trayAdvancedItem.CheckOnClick = true;
-            trayAdvancedItem.Click += delegate { ApplyAdvanced(trayAdvancedItem.Checked); };
-            trayMenu.Items.Add(trayAdvancedItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exit);
 
@@ -1634,7 +1592,6 @@ namespace ZapretGUI
             autoEnableCheck.Checked = GetBool(ini, "autoenable", false);
             trayCheck.Checked = GetBool(ini, "closeToTray", true);
             tgCheck.Checked = GetBool(ini, "tgEnabled", false);
-            advanced = GetBool(ini, "advanced", false);
             checkUpdates = GetBool(ini, "check_updates", true); // default on; replaces the old utils\check_updates.enabled flag
             try
             {
@@ -1655,7 +1612,7 @@ namespace ZapretGUI
             try
             {
                 Dictionary<string, string> d = Core.LoadIni();
-                d["advanced"] = advanced ? "1" : "0";
+                d.Remove("advanced");
                 d["check_updates"] = checkUpdates ? "1" : "0";
                 d["strategy"] = current != null ? current.FileName : "";
                 d["gamefilter"] = gameMode.ToString();
