@@ -6,3 +6,8 @@
 
 .vscode/
 /build/
+/gui/warp.conf
+/ZapretGUI.exe
+/ZapretGUI.ini
+*.old
+/zapret-*.zip*
