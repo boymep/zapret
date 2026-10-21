@@ -14,6 +14,7 @@ Upstream-проект [flowseal/zapret-discord-youtube](https://github.com/Flows
 - Telegram через AmneziaWG с регистрацией Cloudflare WARP для каждого пользователя отдельно.
 - Встроенное обновление из релизов этого репозитория с проверкой SHA256.
 - Релизы выпускаются вручную после просмотра изменений upstream.
+- YouTube QUIC (UDP 443) обрабатывается во всех стратегиях (в оригинале только TCP): отдельное правило для `list-google.txt`.
 
 Подробности о GUI - в [README_GUI.md](./README_GUI.md).
 
@@ -58,6 +59,7 @@ ZapretGUI проверяет новые версии в [Releases](https://githu
 2. Обновите версию в `.service/version.txt` и в `set "LOCAL_VERSION=..."` в `service.bat` (значения должны совпадать).
 3. По желанию добавьте текст в `.github/RELEASE_NOTES.md` - он попадёт в описание релиза.
 4. Запустите workflow **Release** (Actions - Release - Run workflow). Он проверит версию, соберёт `ZapretGUI.exe`, упакует `zapret-<версия>.zip` и `.sha256` и создаст релиз `v<версия>`. Файл `gui/warp.conf` в репозитории быть не должен.
+5. При слиянии изменений стратегий из upstream сохраняйте добавленное правило `--filter-udp=443 --hostlist="%LISTS%list-google.txt"` (UDP 443 для YouTube) в каждом `general*.bat`: в upstream его нет.
 
 ## Частые проблемы
 

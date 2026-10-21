@@ -216,6 +216,15 @@ namespace ZapretGUI
             "2001:b28:f23d::/48", "2001:b28:f23f::/48", "2001:67c:4e8::/48", "2001:b28:f23c::/48", "2a0a:f280::/32"
         };
 
+        // Curated Google front-end ranges (cover youtube.com, googlevideo.com, ytimg.com front ends). Static, no network fetch.
+        public static readonly string[] YtCidrs =
+        {
+            "64.233.160.0/19", "66.102.0.0/20", "66.249.64.0/19", "72.14.192.0/18", "74.125.0.0/16",
+            "108.177.0.0/17", "142.250.0.0/15", "172.217.0.0/16", "172.253.0.0/16", "173.194.0.0/16",
+            "192.178.0.0/15", "209.85.128.0/17", "216.58.192.0/19", "216.239.32.0/19",
+            "2001:4860::/32", "2404:6800::/32", "2607:f8b0::/32", "2800:3f0::/32", "2a00:1450::/32", "2c0f:fb50::/32"
+        };
+
         public static string AmneziaExe
         {
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AmneziaWG\\amneziawg.exe"); }
@@ -890,6 +899,9 @@ namespace ZapretGUI
         CheckBox tgCheck;
         Label tgStatus;
         ToolStripMenuItem trayTgItem;
+        CheckBox ytCheck;
+        ToolStripMenuItem trayYtItem;
+        volatile bool tgWant, ytWant;
         bool tgUp;
         readonly object tgLock = new object();
         TabPage mainPage, servicePage;
@@ -1071,8 +1083,8 @@ namespace ZapretGUI
                 {
                     bool had = File.Exists(Warp.AccountPath);
                     lock (tgLock) { Warp.ResetAccount(); }
-                    Log(had ? "WARP-аккаунт сброшен, новый будет создан при следующем включении Telegram VPN." : "Сохранённого WARP-аккаунта нет.");
-                    if (had && tgUp && tgCheck.Checked && IsRunning) { TgDown(); TgUp(); TgRefresh(); }
+                    Log(had ? "WARP-аккаунт сброшен, новый будет создан при следующем включении VPN." : "Сохранённого WARP-аккаунта нет.");
+                    if (had && tgUp && (tgCheck.Checked || ytCheck.Checked) && IsRunning) { TgDown(); TgUp(); TgRefresh(); }
                 }
                 catch (Exception ex) { Log("Не удалось сбросить WARP-аккаунт: " + ex.Message); }
             });
@@ -1083,10 +1095,32 @@ namespace ZapretGUI
         void OnTgCheckChanged(object sender, EventArgs e)
         {
             trayTgItem.Checked = tgCheck.Checked;
+            tgWant = tgCheck.Checked;
+            OnVpnSelectionChanged();
+        }
+
+        void OnYtCheckChanged(object sender, EventArgs e)
+        {
+            trayYtItem.Checked = ytCheck.Checked;
+            ytWant = ytCheck.Checked;
+            OnVpnSelectionChanged();
+        }
+
+        // Either service toggled: rebuild the tunnel with the new set of ranges, or bring it down.
+        void OnVpnSelectionChanged()
+        {
             if (loading) return;
             SaveState();
-            if (tgCheck.Checked) { if (IsRunning) TgUpAsync(); }
+            if (tgCheck.Checked || ytCheck.Checked)
+            {
+                if (IsRunning) TgRestartAsync();
+            }
             else TgDownAsync();
+        }
+
+        void TgRestartAsync()
+        {
+            ThreadPool.QueueUserWorkItem(delegate { try { TgDown(); TgUp(); } catch (Exception ex) { Log("Туннель VPN: " + ex.Message); } TgRefresh(); });
         }
 
         void TgUpAsync()
@@ -1119,10 +1153,17 @@ namespace ZapretGUI
             {
                 tgUp = up;
                 if (!installed) { tgStatus.Text = "Туннель: AmneziaWG не установлен"; tgStatus.ForeColor = Color.Firebrick; }
-                else if (up) { tgStatus.Text = "Туннель: подключён"; tgStatus.ForeColor = Color.FromArgb(30, 130, 50); }
+                else if (up) { tgStatus.Text = "Туннель: включён (" + TgServicesText() + ")"; tgStatus.ForeColor = Color.FromArgb(30, 130, 50); }
                 else { tgStatus.Text = "Туннель: отключён"; tgStatus.ForeColor = Color.DimGray; }
                 UpdateUi();
             });
+        }
+
+        string TgServicesText()
+        {
+            string s = tgCheck.Checked ? "Telegram" : "";
+            if (ytCheck.Checked) s += (s.Length > 0 ? ", " : "") + "YouTube";
+            return s.Length > 0 ? s : "нет сервисов";
         }
 
         // Runs amneziawg.exe hidden, logs exit code and (key-free) output.
@@ -1158,9 +1199,22 @@ namespace ZapretGUI
                     if (m.Value != Core.TgServiceName)
                         Log("Предупреждение: запущен другой VPN-туннель (" + m.Value + "). Возможен конфликт маршрутов.");
 
-                bool fresh;
-                string[] cidrs = Core.FetchTgCidrs(out fresh);
-                Log("Подсети Telegram: " + cidrs.Length + (fresh ? " (telegram.org)" : " (встроенный список)"));
+                List<string> cidrList = new List<string>();
+                bool wantTg = tgWant, wantYt = ytWant;
+                if (wantTg)
+                {
+                    bool fresh;
+                    string[] tgc = Core.FetchTgCidrs(out fresh);
+                    Log("Подсети Telegram: " + tgc.Length + (fresh ? " (telegram.org)" : " (встроенный список)"));
+                    cidrList.AddRange(tgc);
+                }
+                if (wantYt)
+                {
+                    Log("Подсети YouTube/Google: " + Core.YtCidrs.Length + " (встроенный список)");
+                    foreach (string c in Core.YtCidrs) if (!cidrList.Contains(c)) cidrList.Add(c);
+                }
+                if (cidrList.Count == 0) return;
+                string[] cidrs = cidrList.ToArray();
                 string conf = Core.BuildTgConfig(src, cidrs);
                 if (st != null) RunAmnezia("/uninstalltunnelservice " + Core.TgTunnelName);
                 Core.WriteTgConfigSecure(Core.TgConfPath, conf);
@@ -1324,7 +1378,7 @@ namespace ZapretGUI
 
             // Telegram split tunnel group
             GroupBox tg = new GroupBox();
-            tg.Text = "Telegram через VPN (AmneziaWG)";
+            tg.Text = "VPN через WARP (AmneziaWG)";
             tg.Dock = DockStyle.Fill;
             tg.AutoSize = true;
             tg.AutoSizeMode = AutoSizeMode.GrowAndShrink;
@@ -1341,21 +1395,25 @@ namespace ZapretGUI
             tgCheck.CheckedChanged += OnTgCheckChanged;
             tgt.Controls.Add(tgCheck, 0, 0);
             tgt.SetColumnSpan(tgCheck, 2);
+            ytCheck = NewCheck("Направлять YouTube через VPN");
+            ytCheck.CheckedChanged += OnYtCheckChanged;
+            tgt.Controls.Add(ytCheck, 0, 1);
+            tgt.SetColumnSpan(ytCheck, 2);
             tgStatus = new Label();
             tgStatus.AutoSize = true;
             tgStatus.Margin = new Padding(3, 4, 3, 2);
             tgStatus.Text = "Туннель: ...";
-            tgt.Controls.Add(tgStatus, 0, 1);
+            tgt.Controls.Add(tgStatus, 0, 2);
             tgt.SetColumnSpan(tgStatus, 2);
             Label tgHint = new Label();
             tgHint.AutoSize = true;
             tgHint.ForeColor = Color.DimGray;
             tgHint.Margin = new Padding(3, 0, 3, 2);
             tgHint.Text = Core.HasEmbeddedTgConfig()
-                ? "Через туннель идёт только трафик Telegram."
-                : "Через туннель идёт только трафик Telegram. Аккаунт Cloudflare WARP создаётся автоматически при первом включении.";
+                ? "Через туннель идёт только трафик выбранных сервисов."
+                : "Через туннель идёт только трафик выбранных сервисов. Аккаунт Cloudflare WARP создаётся автоматически при первом включении.";
             tgHint.MaximumSize = new Size(430, 0);
-            tgt.Controls.Add(tgHint, 0, 2);
+            tgt.Controls.Add(tgHint, 0, 3);
             tgt.SetColumnSpan(tgHint, 2);
             AddRow(t, tg, 0);
 
@@ -1455,6 +1513,10 @@ namespace ZapretGUI
             trayTgItem.CheckOnClick = true;
             trayTgItem.Click += delegate { tgCheck.Checked = trayTgItem.Checked; };
             trayMenu.Items.Add(trayTgItem);
+            trayYtItem = new ToolStripMenuItem("YouTube через VPN");
+            trayYtItem.CheckOnClick = true;
+            trayYtItem.Click += delegate { ytCheck.Checked = trayYtItem.Checked; };
+            trayMenu.Items.Add(trayYtItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exit);
 
@@ -1592,6 +1654,7 @@ namespace ZapretGUI
             autoEnableCheck.Checked = GetBool(ini, "autoenable", false);
             trayCheck.Checked = GetBool(ini, "closeToTray", true);
             tgCheck.Checked = GetBool(ini, "tgEnabled", false);
+            ytCheck.Checked = GetBool(ini, "ytEnabled", false);
             checkUpdates = GetBool(ini, "check_updates", true); // default on; replaces the old utils\check_updates.enabled flag
             try
             {
@@ -1600,6 +1663,7 @@ namespace ZapretGUI
             }
             catch (Exception) { }
             trayTgItem.Checked = tgCheck.Checked;
+            trayYtItem.Checked = ytCheck.Checked;
             autostartCheck.Checked = QueryTask();
 
             RebuildTrayStrategies();
@@ -1619,6 +1683,7 @@ namespace ZapretGUI
                 d["autoenable"] = autoEnableCheck.Checked ? "1" : "0";
                 d["closeToTray"] = trayCheck.Checked ? "1" : "0";
                 d["tgEnabled"] = tgCheck.Checked ? "1" : "0";
+                d["ytEnabled"] = ytCheck.Checked ? "1" : "0";
                 d["wasRunning"] = IsRunning ? "1" : "0";
                 Core.SaveIni(d);
             }
@@ -1639,7 +1704,7 @@ namespace ZapretGUI
             bool on = IsRunning;
             toggleButton.Text = on ? "ВЫКЛЮЧИТЬ" : "ВКЛЮЧИТЬ";
             toggleButton.BackColor = on ? Color.FromArgb(200, 60, 55) : Color.FromArgb(46, 160, 70);
-            statusLabel.Text = on ? "Обход: включён (" + (current != null ? current.Display : "") + ")" + (tgUp ? " + Telegram через VPN" : "") : "Обход: выключен";
+            statusLabel.Text = on ? "Обход: включён (" + (current != null ? current.Display : "") + ")" + (tgUp ? " + VPN" : "") : "Обход: выключен";
             statusLabel.ForeColor = on ? Color.FromArgb(30, 130, 50) : Color.DimGray;
             Icon ic = on ? iconOn : iconOff;
             Icon = ic;
@@ -1836,7 +1901,7 @@ namespace ZapretGUI
                 p.BeginErrorReadLine();
                 winws = p;
                 Log("Обход включён: " + current.Display + " (PID " + p.Id + ")");
-                if (tgCheck.Checked) TgUpAsync();
+                if (tgCheck.Checked || ytCheck.Checked) TgUpAsync();
             }
             catch (Exception ex)
             {
@@ -2753,7 +2818,7 @@ namespace ZapretGUI
                 Out("[OK] Проверка при запуске: " + (updatesCheck.Checked ? "включена." : "выключена."));
             };
             s.Controls.Add(updatesCheck);
-            Desc(s, "Для Telegram через VPN у каждого пользователя свой аккаунт Cloudflare WARP (создаётся автоматически).");
+            Desc(s, "Для VPN (Telegram, YouTube) у каждого пользователя свой аккаунт Cloudflare WARP (создаётся автоматически).");
             Btn(Row(s), "Сбросить WARP-аккаунт", delegate
             {
                 main.ResetWarp();
