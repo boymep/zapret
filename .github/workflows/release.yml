@@ -40,7 +40,7 @@ jobs:
           $name = "zapret-$env:VERSION"
           $stage = Join-Path $env:RUNNER_TEMP $name
           New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item ZapretGUI.exe, service.bat, LICENSE.txt, README.md, README_GUI.md $stage
+          Copy-Item ZapretGUI.exe, service.bat, LICENSE.txt, README.md, README_GUI.md, unlocker.bat $stage
           Copy-Item general*.bat $stage
           foreach ($d in 'bin', 'lists', 'utils') { Copy-Item $d (Join-Path $stage $d) -Recurse }
           Get-ChildItem $stage -Recurse -File -Filter '*-user.txt' | Remove-Item -Force

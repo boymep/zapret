@@ -204,6 +204,70 @@ namespace ZapretGUI
             return m.Success ? m.Groups[1].Value : "UNKNOWN";
         }
 
+        // ---------- static helpers shared by the UI and --cleanup (no MainForm needed) ----------
+
+        // Kills every winws.exe. Returns false if any could not be killed.
+        public static bool KillWinws(Action<string> log)
+        {
+            bool ok = true;
+            foreach (Process p in Process.GetProcessesByName("winws"))
+            {
+                try
+                {
+                    log("Найден winws.exe (PID " + p.Id + "), завершаю.");
+                    p.Kill();
+                    p.WaitForExit(3000);
+                }
+                catch (Exception ex) { ok = false; log("Не удалось завершить winws.exe: " + ex.Message); }
+                finally { p.Dispose(); }
+            }
+            return ok;
+        }
+
+        // Runs amneziawg.exe hidden, logs exit code and (key-free) output. null on success.
+        public static string RunAmnezia(string args, Action<string> log)
+        {
+            int code;
+            string o = RunTool(AmneziaExe, args, out code);
+            StringBuilder sb = new StringBuilder();
+            foreach (string l in o.Split('\n'))
+            {
+                string t = l.Trim();
+                if (t.Length == 0 || Regex.IsMatch(t, @"(?i)key|^[A-Z]\w*\s*=")) continue;
+                sb.Append(t.Length > 200 ? t.Substring(0, 200) : t).Append(' ');
+            }
+            log("amneziawg.exe " + args.Split(' ')[0] + ": код " + code + (sb.Length > 0 ? ", " + sb.ToString().Trim() : ""));
+            return code == 0 ? null : "код " + code;
+        }
+
+        // Removes the zapret-tg tunnel service and the generated config. Caller holds any needed lock.
+        public static bool TgTeardown(Action<string> log)
+        {
+            bool ok = true;
+            if (File.Exists(AmneziaExe) && ServiceState(TgServiceName) != null)
+            {
+                if (RunAmnezia("/uninstalltunnelservice " + TgTunnelName, log) != null) ok = false;
+                for (int i = 0; i < 20 && ServiceState(TgServiceName) != null; i++) Thread.Sleep(250);
+                log("Туннель Telegram: отключён.");
+            }
+            try { if (File.Exists(TgConfPath)) File.Delete(TgConfPath); }
+            catch (Exception) { ok = false; }
+            return ok;
+        }
+
+        public static bool DeleteTask(Action<string> log)
+        {
+            try
+            {
+                int code;
+                string o = RunTool("schtasks.exe", "/Delete /TN " + TaskName + " /F", out code);
+                if (code != 0) { log("schtasks /Delete: " + o); return false; }
+                log("Автозапуск отключён.");
+                return true;
+            }
+            catch (Exception ex) { log("Ошибка удаления автозапуска: " + ex.Message); return false; }
+        }
+
         // ---------- Telegram split tunnel through AmneziaWG ----------
 
         public const string TgTunnelName = "zapret-tg";
@@ -1515,7 +1579,9 @@ namespace ZapretGUI
         volatile bool tgWant, ytWant;
         bool tgUp;
         readonly object tgLock = new object();
-        TabPage mainPage, servicePage;
+        TabPage mainPage, servicePage, settingsPage;
+        Label statusDot;
+        CheckBox updatesCheck;
         Label versionLabel, updateStatus;
         Button updateButton;
         bool updating;
@@ -1541,17 +1607,24 @@ namespace ZapretGUI
             CheckService();
             Dictionary<string, string> ini = Core.LoadIni();
             bool auto = GetBool(ini, "autoenable", false);
+#if PREVIEW
+            auto = false; resumeAfter = false;
+#endif
             if (auto || resumeAfter)
                 BeginInvoke(new MethodInvoker(delegate { Start(); }));
             serviceTab.StartupRefresh();
             TgRefreshAsync();
+#if !PREVIEW
             if (secureDnsCheck.Checked) SecureDnsRun(true, true);
+#endif
             if (afterUpdate)
             {
                 Log("Обновлено до версии " + Core.LocalVersion());
                 Balloon("Обновлено до версии " + Core.LocalVersion());
             }
+#if !PREVIEW
             StartupUpdateCheck();
+#endif
         }
 
         // ---------- updates ----------
@@ -1681,6 +1754,11 @@ namespace ZapretGUI
             if (wasOn && !IsRunning) Start();
         }
 
+#if PREVIEW
+        public void PreviewTab(int i) { tabs.SelectedIndex = i; }
+        public void PreviewSize(int w, int h) { ClientSize = new Size(w, h); }
+#endif
+
         public bool CheckUpdatesEnabled
         {
             get { return checkUpdates; }
@@ -1781,17 +1859,7 @@ namespace ZapretGUI
         // Runs amneziawg.exe hidden, logs exit code and (key-free) output.
         string RunAmnezia(string args)
         {
-            int code;
-            string o = Core.RunTool(Core.AmneziaExe, args, out code);
-            StringBuilder sb = new StringBuilder();
-            foreach (string l in o.Split('\n'))
-            {
-                string t = l.Trim();
-                if (t.Length == 0 || Regex.IsMatch(t, @"(?i)key|^[A-Z]\w*\s*=")) continue;
-                sb.Append(t.Length > 200 ? t.Substring(0, 200) : t).Append(' ');
-            }
-            Log("amneziawg.exe " + args.Split(' ')[0] + ": код " + code + (sb.Length > 0 ? ", " + sb.ToString().Trim() : ""));
-            return code == 0 ? null : "код " + code;
+            return Core.RunAmnezia(args, Log);
         }
 
         void TgUp()
@@ -1844,13 +1912,7 @@ namespace ZapretGUI
         {
             lock (tgLock)
             {
-                if (File.Exists(Core.AmneziaExe) && Core.ServiceState(Core.TgServiceName) != null)
-                {
-                    RunAmnezia("/uninstalltunnelservice " + Core.TgTunnelName);
-                    for (int i = 0; i < 20 && Core.ServiceState(Core.TgServiceName) != null; i++) Thread.Sleep(250);
-                    Log("Туннель Telegram: отключён.");
-                }
-                try { if (File.Exists(Core.TgConfPath)) File.Delete(Core.TgConfPath); } catch (Exception) { }
+                Core.TgTeardown(Log);
             }
         }
 
@@ -1900,20 +1962,24 @@ namespace ZapretGUI
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96f, 96f);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(640, 720);
-            MinimumSize = new Size(560, 600); // main tab has the update row; keeps the log readable
+            ClientSize = new Size(660, Math.Min(1020, Screen.PrimaryScreen.WorkingArea.Height - 60));
+            MinimumSize = new Size(600, 640);
             Padding = new Padding(8);
 
             tabs = new TabControl();
             tabs.Dock = DockStyle.Fill;
             mainPage = new TabPage("Главная");
             mainPage.UseVisualStyleBackColor = true;
-            mainPage.Padding = new Padding(10);
+            mainPage.Padding = new Padding(12);
+            settingsPage = new TabPage("Настройки");
+            settingsPage.UseVisualStyleBackColor = true;
+            settingsPage.Padding = new Padding(12);
             listsPage = new TabPage("Списки");
             listsPage.UseVisualStyleBackColor = true;
             servicePage = new TabPage("Сервис");
             servicePage.UseVisualStyleBackColor = true;
             tabs.TabPages.Add(mainPage);
+            tabs.TabPages.Add(settingsPage);
             tabs.TabPages.Add(listsPage);
             tabs.TabPages.Add(servicePage);
             Controls.Add(tabs);
@@ -1931,139 +1997,8 @@ namespace ZapretGUI
             serviceTab.Dock = DockStyle.Fill;
             servicePage.Controls.Add(serviceTab);
 
-            TableLayoutPanel t = new TableLayoutPanel();
-            t.Dock = DockStyle.Fill;
-            t.ColumnCount = 2;
-            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            mainPage.Controls.Add(t);
-
-            // Version + update row
-            FlowLayoutPanel ur = new FlowLayoutPanel();
-            ur.AutoSize = true;
-            ur.Dock = DockStyle.Fill;
-            ur.WrapContents = true;
-            ur.Margin = new Padding(0, 0, 0, 6);
-            updateButton = new Button();
-            updateButton.AutoSize = true;
-            updateButton.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            updateButton.Text = "Проверить обновления";
-            updateButton.Padding = new Padding(6, 1, 6, 1);
-            updateButton.Click += delegate { CheckForUpdates(); };
-            versionLabel = new Label();
-            versionLabel.AutoSize = true;
-            versionLabel.Margin = new Padding(8, 8, 3, 3);
-            versionLabel.Text = "Версия " + Core.LocalVersion();
-            updateStatus = new Label();
-            updateStatus.AutoSize = true;
-            updateStatus.ForeColor = Color.DimGray;
-            updateStatus.Margin = new Padding(8, 8, 3, 3);
-            ur.Controls.Add(updateButton);
-            ur.Controls.Add(versionLabel);
-            ur.Controls.Add(updateStatus);
-            AddRow(t, ur, 0);
-
-            strategyBox = new ComboBox();
-            strategyBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            strategyBox.Dock = DockStyle.Fill;
-            strategyBox.SelectedIndexChanged += OnStrategyChanged;
-            AddLabeled(t, "Стратегия:", strategyBox);
-
-            gameBox = new ComboBox();
-            gameBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            gameBox.Dock = DockStyle.Fill;
-            gameBox.Items.AddRange(new object[] { "Выкл", "TCP+UDP", "TCP", "UDP" });
-            gameBox.SelectedIndex = 0;
-            gameBox.SelectedIndexChanged += OnGameChanged;
-            AddLabeled(t, "Игровой фильтр:", gameBox);
-
-            autostartCheck = NewCheck("Запускать вместе с Windows");
-            autoEnableCheck = NewCheck("Включать обход при запуске");
-            trayCheck = NewCheck("Сворачивать в трей при закрытии");
-            trayCheck.Checked = true;
-            autostartCheck.Click += OnAutostartClick;
-            autoEnableCheck.CheckedChanged += delegate { SaveState(); };
-            trayCheck.CheckedChanged += delegate { SaveState(); };
-            AddRow(t, autostartCheck, 0);
-            AddRow(t, autoEnableCheck, 0);
-            AddRow(t, trayCheck, 0);
-            secureDnsCheck = NewCheck("Защищённый DNS (DoH через Cloudflare)");
-            secureDnsCheck.Click += delegate { SecureDnsRun(secureDnsCheck.Checked, false); };
-            dnsTip = new ToolTip();
-            dnsTip.AutoPopDelay = 30000;
-            dnsTip.SetToolTip(secureDnsCheck, "Провайдер может подменять DNS-ответы (например, для youtube.com). Включает DNS через HTTPS 1.1.1.1 для всей Windows. При выключении прежние настройки DNS восстанавливаются.");
-            AddRow(t, secureDnsCheck, 0);
-
-            // Telegram split tunnel group
-            GroupBox tg = new GroupBox();
-            tg.Text = "VPN через WARP (AmneziaWG)";
-            tg.Dock = DockStyle.Fill;
-            tg.AutoSize = true;
-            tg.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            tg.Padding = new Padding(8, 4, 8, 6);
-            tg.Margin = new Padding(3, 6, 3, 3);
-            TableLayoutPanel tgt = new TableLayoutPanel();
-            tgt.Dock = DockStyle.Top;
-            tgt.AutoSize = true;
-            tgt.ColumnCount = 2;
-            tgt.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-            tgt.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            tg.Controls.Add(tgt);
-            tgCheck = NewCheck("Направлять Telegram через VPN");
-            tgCheck.CheckedChanged += OnTgCheckChanged;
-            tgt.Controls.Add(tgCheck, 0, 0);
-            tgt.SetColumnSpan(tgCheck, 2);
-            ytCheck = NewCheck("Направлять YouTube через VPN");
-            ytCheck.CheckedChanged += OnYtCheckChanged;
-            tgt.Controls.Add(ytCheck, 0, 1);
-            tgt.SetColumnSpan(ytCheck, 2);
-            tgStatus = new Label();
-            tgStatus.AutoSize = true;
-            tgStatus.Margin = new Padding(3, 4, 3, 2);
-            tgStatus.Text = "Туннель: ...";
-            tgt.Controls.Add(tgStatus, 0, 2);
-            tgt.SetColumnSpan(tgStatus, 2);
-            Label tgHint = new Label();
-            tgHint.AutoSize = true;
-            tgHint.ForeColor = Color.DimGray;
-            tgHint.Margin = new Padding(3, 0, 3, 2);
-            tgHint.Text = Core.HasEmbeddedTgConfig()
-                ? "Через туннель идёт только трафик выбранных сервисов."
-                : "Через туннель идёт только трафик выбранных сервисов. Аккаунт Cloudflare WARP создаётся автоматически при первом включении.";
-            tgHint.MaximumSize = new Size(430, 0);
-            tgt.Controls.Add(tgHint, 0, 3);
-            tgt.SetColumnSpan(tgHint, 2);
-            AddRow(t, tg, 0);
-
-            logBox = new TextBox();
-            logBox.Multiline = true;
-            logBox.ReadOnly = true;
-            logBox.ScrollBars = ScrollBars.Vertical;
-            logBox.Dock = DockStyle.Fill;
-            logBox.Font = new Font("Consolas", 9f);
-            logBox.BackColor = Color.White;
-            logBox.MaxLength = 0;
-            t.Controls.Add(logBox, 0, NextRow(t));
-            t.SetColumnSpan(logBox, 2);
-            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-
-            statusLabel = new Label();
-            statusLabel.Dock = DockStyle.Fill;
-            statusLabel.AutoSize = true;
-            statusLabel.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-            statusLabel.Margin = new Padding(3, 8, 3, 6);
-            AddRow(t, statusLabel, 0);
-
-            toggleButton = new Button();
-            toggleButton.Dock = DockStyle.Fill;
-            toggleButton.Height = 64;
-            toggleButton.Font = new Font("Segoe UI", 16f, FontStyle.Bold);
-            toggleButton.FlatStyle = FlatStyle.Flat;
-            toggleButton.FlatAppearance.BorderSize = 0;
-            toggleButton.ForeColor = Color.White;
-            toggleButton.Margin = new Padding(3, 3, 3, 3);
-            toggleButton.Click += delegate { Toggle(); };
-            AddRow(t, toggleButton, 64);
+            BuildMainPage();
+            BuildSettingsPage();
 
             Resize += delegate
             {
@@ -2072,33 +2007,343 @@ namespace ZapretGUI
             FormClosing += OnFormClosing;
         }
 
-        // Rows: all AutoSize except the toggle button (fixed) and the log (fills).
-        void AddRow(TableLayoutPanel t, Control c, int height)
+        // ---- layout helpers (shared by Главная and Настройки): every setting is a card on one grid ----
+
+        static readonly Color HintColor = Color.FromArgb(110, 115, 122);
+        static readonly Color LineColor = Color.FromArgb(222, 226, 231);
+        static readonly Color CardColor = Color.FromArgb(243, 245, 248);
+        const int CardPad = 10;     // inner padding of a card
+        const int Gap = 8;          // between consecutive cards and below headers
+        const int SectionGap = 16;  // before a section header
+        const int LineGap = 4;      // between lines inside a card
+        const int TextInset = 4;    // GDI text starts this many px right of the control edge; labels are shifted back
+        const int CheckIndent = 22; // hint text starts under the check box caption
+
+        readonly List<Label> wrapLabels = new List<Label>();
+
+        // Vertical stack of full-width rows; hint labels inside wrap to its width.
+        TableLayoutPanel NewStack()
         {
-            int row = NextRow(t);
-            t.Controls.Add(c, 0, row);
-            t.SetColumnSpan(c, 2);
-            if (height > 0) t.RowStyles.Add(new RowStyle(SizeType.Absolute, height + 12));
-            else t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            TableLayoutPanel t = new TableLayoutPanel();
+            t.ColumnCount = 1;
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            t.Margin = new Padding(0);
+            t.SizeChanged += delegate { ApplyWrap(t); };
+            return t;
         }
 
-        void AddLabeled(TableLayoutPanel t, string text, Control c)
+        void AddStack(TableLayoutPanel t, Control c, Padding margin)
         {
-            int row = NextRow(t);
+            c.Margin = margin;
+            c.Dock = DockStyle.Fill;
+            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            t.Controls.Add(c, 0, t.RowStyles.Count - 1);
+        }
+
+        // Section title (Segoe UI Semibold 10pt) with a 1px separator underneath.
+        void SectionHeader(TableLayoutPanel t, string text, int top)
+        {
+            Panel p = new Panel();
+            p.Height = 26;
+            Panel line = new Panel();
+            line.Dock = DockStyle.Bottom;
+            line.Height = 1;
+            line.BackColor = LineColor;
+            Label l = new Label();
+            l.SetBounds(-4, 0, 204, 25); // -3: cancel the label text inset so the title aligns with the cards
+            l.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            l.Text = text;
+            l.Font = new Font("Segoe UI Semibold", 10f);
+            l.TextAlign = ContentAlignment.BottomLeft;
+            l.Padding = new Padding(0, 0, 0, 3);
+            p.Controls.Add(l);
+            p.Controls.Add(line);
+            AddStack(t, p, new Padding(0, top, 0, Gap));
+        }
+
+        // Gray 8.5pt description; wraps to the card width (see ApplyWrap).
+        Label Hint(string text, int indent)
+        {
             Label l = new Label();
             l.Text = text;
             l.AutoSize = true;
-            l.Anchor = AnchorStyles.Left;
-            l.Margin = new Padding(3, 6, 12, 6);
-            t.Controls.Add(l, 0, row);
-            c.Margin = new Padding(3, 3, 3, 3);
-            t.Controls.Add(c, 1, row);
-            t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            l.ForeColor = HintColor;
+            l.Font = new Font("Segoe UI", 8.5f);
+            l.Tag = indent;
+            l.Margin = new Padding(Math.Max(0, indent - TextInset), LineGap, 0, 0);
+            wrapLabels.Add(l);
+            return l;
         }
 
-        int NextRow(TableLayoutPanel t)
+        void ApplyWrap(TableLayoutPanel stack)
         {
-            return t.RowStyles.Count;
+            float scale;
+            using (Graphics g = CreateGraphics()) scale = g.DpiX / 96f;
+            foreach (Label l in wrapLabels)
+            {
+                if (!IsInside(l, stack)) continue;
+                int w = stack.ClientSize.Width - (int)((2 * CardPad + (int)l.Tag) * scale) - 2;
+                if (w < 100) w = 100;
+                l.MaximumSize = new Size(w, 0);
+            }
+        }
+
+        static bool IsInside(Control c, Control root)
+        {
+            while (c != null) { if (c == root) return true; c = c.Parent; }
+            return false;
+        }
+
+        // One setting card: full width, subtle background, identical padding.
+        TableLayoutPanel NewCard(TableLayoutPanel stack)
+        {
+            TableLayoutPanel card = new TableLayoutPanel();
+            card.ColumnCount = 1;
+            card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            card.AutoSize = true;
+            card.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            card.BackColor = CardColor;
+            card.Padding = new Padding(CardPad);
+            AddStack(stack, card, new Padding(0, 0, 0, Gap));
+            return card;
+        }
+
+        void CardRow(TableLayoutPanel card, Control c)
+        {
+            card.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            card.Controls.Add(c, 0, card.RowStyles.Count - 1);
+        }
+
+        // Card with a check box (title = check box text) and a gray hint aligned with the caption.
+        void CheckCard(TableLayoutPanel stack, CheckBox c, string hint)
+        {
+            TableLayoutPanel card = NewCard(stack);
+            c.Margin = new Padding(0);
+            c.Anchor = AnchorStyles.Left;
+            c.Font = new Font("Segoe UI Semibold", 9f);
+            CardRow(card, c);
+            CardRow(card, Hint(hint, CheckIndent));
+        }
+
+        // Card with title, control and hint stacked vertically.
+        void ValueCard(TableLayoutPanel stack, string title, Control c, string hint)
+        {
+            TableLayoutPanel card = NewCard(stack);
+            Label t = new Label();
+            t.Text = title;
+            t.AutoSize = true;
+            t.Font = new Font("Segoe UI Semibold", 9f);
+            t.Margin = new Padding(0, 0, 0, LineGap);
+            CardRow(card, t);
+            card.Padding = new Padding(CardPad - TextInset, CardPad, CardPad, CardPad); // GDI text is inset by TextInset px: shift the card padding and the control by the same amount so all visible left edges match
+            c.Margin = new Padding(TextInset, 0, 0, 0);
+            if (c is ComboBox) c.Dock = DockStyle.Fill; else c.Anchor = AnchorStyles.Left;
+            CardRow(card, c);
+            CardRow(card, Hint(hint, 0));
+        }
+
+        void BuildMainPage()
+        {
+            TableLayoutPanel outer = new TableLayoutPanel();
+            outer.Dock = DockStyle.Fill;
+            outer.ColumnCount = 1;
+            outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            mainPage.Controls.Add(outer);
+
+            // 1. update bar
+            FlowLayoutPanel ur = new FlowLayoutPanel();
+            ur.AutoSize = true;
+            ur.WrapContents = false;
+            ur.Anchor = AnchorStyles.Left;
+            updateButton = new Button();
+            updateButton.AutoSize = true;
+            updateButton.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            updateButton.Text = "Проверить обновления";
+            updateButton.Margin = new Padding(TextInset, 0, 0, 0);
+            updateButton.Padding = new Padding(6, 0, 6, 0);
+            updateButton.Click += delegate { CheckForUpdates(); };
+            versionLabel = new Label();
+            versionLabel.AutoSize = true;
+            versionLabel.Margin = new Padding(12, 7, 0, 0);
+            versionLabel.Text = "Версия " + Core.LocalVersion();
+            updateStatus = new Label();
+            updateStatus.AutoSize = true;
+            updateStatus.ForeColor = Color.DimGray;
+            updateStatus.Margin = new Padding(12, 7, 0, 0);
+            ur.Controls.Add(updateButton);
+            ur.Controls.Add(versionLabel);
+            ur.Controls.Add(updateStatus);
+ur.Margin = new Padding(0);            TableLayoutPanel top = NewStack();            top.AutoSize = true;            top.Dock = DockStyle.Fill;            SectionHeader(top, "Обновления", 0);            TableLayoutPanel ucard = NewCard(top);            ucard.Padding = new Padding(CardPad - TextInset, CardPad, CardPad, CardPad);            CardRow(ucard, ur);            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));            outer.Controls.Add(top, 0, 0);
+
+            // scrollable area with the cards (the log below stays visible)
+            Panel scroll = new Panel();
+            scroll.Dock = DockStyle.Fill;
+            scroll.AutoScroll = true;
+            scroll.Margin = new Padding(0);
+            outer.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
+            outer.Controls.Add(scroll, 0, 1);
+            TableLayoutPanel t = NewStack();
+            t.Dock = DockStyle.Top;
+            t.AutoSize = true;
+            scroll.Controls.Add(t);
+
+            // 2. bypass
+            SectionHeader(t, "Обход", SectionGap - Gap);
+            strategyBox = new ComboBox();
+            strategyBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            strategyBox.SelectedIndexChanged += OnStrategyChanged;
+            gameBox = new ComboBox();
+            gameBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            gameBox.Items.AddRange(new object[] { "Выкл", "TCP+UDP", "TCP", "UDP" });
+            gameBox.SelectedIndex = 0;
+            gameBox.SelectedIndexChanged += OnGameChanged;
+            ValueCard(t, "Стратегия", strategyBox, "Если сайты не открываются, попробуйте другую стратегию.");
+            ValueCard(t, "Игровой фильтр", gameBox, "Открывает игровые порты для обхода в играх. Обычно выключен.");
+
+            // 4. services
+            SectionHeader(t, "Доступ к сервисам", SectionGap - Gap);
+            secureDnsCheck = NewCheck("Защищённый DNS");
+            secureDnsCheck.Click += delegate { SecureDnsRun(secureDnsCheck.Checked, false); };
+            dnsTip = new ToolTip();
+            dnsTip.AutoPopDelay = 30000;
+            dnsTip.SetToolTip(secureDnsCheck, "Провайдер может подменять DNS-ответы (например, для youtube.com). Включает DNS через HTTPS 1.1.1.1 для всей Windows. При выключении прежние настройки DNS восстанавливаются.");
+            tgCheck = NewCheck("Telegram через VPN");
+            tgCheck.CheckedChanged += OnTgCheckChanged;
+            ytCheck = NewCheck("YouTube через VPN");
+            ytCheck.CheckedChanged += OnYtCheckChanged;
+            CheckCard(t, secureDnsCheck, "Если YouTube не открывается с ошибкой DNS. Windows переключается на DNS через HTTPS (Cloudflare).");
+            CheckCard(t, tgCheck, "Трафик Telegram идёт через бесплатный Cloudflare WARP. Нужен AmneziaWG.");
+            CheckCard(t, ytCheck, "Если zapret не справляется с YouTube. Скорость ограничена WARP.");
+            tgStatus = new Label();
+            tgStatus.AutoSize = true;
+            tgStatus.ForeColor = Color.DimGray;
+            tgStatus.Text = "Туннель: ...";
+            tgStatus.Margin = new Padding(0);
+            tgStatus.Anchor = AnchorStyles.Left;
+            TableLayoutPanel tcard = NewCard(t);
+            tcard.Padding = new Padding(CardPad - TextInset, CardPad, CardPad, CardPad);
+            CardRow(tcard, tgStatus);
+
+            // 4. log (stays visible), then the toggle button and the centered status line
+            Panel head = new Panel();
+            head.Height = 26;
+            Panel line = new Panel();
+            line.Dock = DockStyle.Bottom;
+            line.Height = 1;
+            line.BackColor = LineColor;
+            Label hl = new Label();
+            hl.SetBounds(-4, 0, 204, 25);
+            hl.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            hl.Text = "Журнал";
+            hl.Font = new Font("Segoe UI Semibold", 10f);
+            hl.TextAlign = ContentAlignment.BottomLeft;
+            hl.Padding = new Padding(0, 0, 0, 3);
+            head.Controls.Add(hl);
+            head.Controls.Add(line);
+            head.Dock = DockStyle.Fill;
+            head.Margin = new Padding(0, SectionGap - Gap, 0, Gap); // the last card already has a Gap margin below it
+            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            outer.Controls.Add(head, 0, 2);
+            logBox = new TextBox();
+            logBox.Multiline = true;
+            logBox.ReadOnly = true;
+            logBox.ScrollBars = ScrollBars.Vertical;
+            logBox.Font = new Font("Consolas", 8.5f);
+            logBox.BackColor = Color.White;
+            logBox.BorderStyle = BorderStyle.FixedSingle;
+            logBox.MaxLength = 0;
+            logBox.Dock = DockStyle.Fill;
+            logBox.Margin = new Padding(0);
+            outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            outer.Controls.Add(logBox, 0, 3);
+
+            toggleButton = new Button();
+            toggleButton.Dock = DockStyle.Fill;
+            toggleButton.Height = 52;
+            toggleButton.Font = new Font("Segoe UI", 14f, FontStyle.Bold);
+            toggleButton.FlatStyle = FlatStyle.Flat;
+            toggleButton.FlatAppearance.BorderSize = 0;
+            toggleButton.ForeColor = Color.White;
+            toggleButton.Margin = new Padding(0, SectionGap, 0, Gap);
+            toggleButton.Click += delegate { Toggle(); };
+            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            outer.Controls.Add(toggleButton, 0, 4);
+
+            Panel statusRow = new Panel();
+            statusRow.Height = 24;
+            statusRow.Dock = DockStyle.Fill;
+            statusRow.Margin = new Padding(0);
+            statusDot = new Label();
+            statusDot.AutoSize = true;
+            statusDot.Text = "●";
+            statusDot.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+            statusLabel = new Label();
+            statusLabel.AutoSize = true;
+            statusLabel.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+            statusLabel.ForeColor = Color.FromArgb(40, 44, 52);
+            statusRow.Controls.Add(statusDot);
+            statusRow.Controls.Add(statusLabel);
+            // keep dot + text centered as a unit whenever either changes or the row is resized
+            MethodInvoker center = delegate
+            {
+                int total = statusDot.Width + statusLabel.Width;
+                int x = (statusRow.ClientSize.Width - total) / 2;
+                if (x < 0) x = 0;
+                int y = (statusRow.ClientSize.Height - statusLabel.Height) / 2;
+                statusDot.Location = new Point(x, y);
+                statusLabel.Location = new Point(x + statusDot.Width - 4, y);
+            };
+            statusLabel.SizeChanged += delegate { center(); };
+            statusRow.SizeChanged += delegate { center(); };
+            outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            outer.Controls.Add(statusRow, 0, 5);
+
+            // cards area is exactly as tall as its content (scrolls only when short of space); the log takes the rest
+            MethodInvoker fit = delegate
+            {
+                int below = head.Height + head.Margin.Vertical + 80 + toggleButton.Height + toggleButton.Margin.Vertical + statusRow.Height + statusRow.Margin.Vertical;
+                int avail = outer.ClientSize.Height - top.Height - below;
+                int h = Math.Max(60, Math.Min(t.Height, avail));
+                if ((int)outer.RowStyles[1].Height != h) outer.RowStyles[1].Height = h;
+            };
+            outer.SizeChanged += delegate { fit(); };
+            outer.Layout += delegate { fit(); };
+            t.SizeChanged += delegate { fit(); };
+        }
+
+        void BuildSettingsPage()
+        {
+            TableLayoutPanel t = NewStack();
+            t.Dock = DockStyle.Top;
+            t.AutoSize = true;
+            settingsPage.Controls.Add(t);
+            SectionHeader(t, "Запуск и поведение", 0);
+            autostartCheck = NewCheck("Запускать вместе с Windows");
+            autoEnableCheck = NewCheck("Включать обход при запуске");
+            trayCheck = NewCheck("Сворачивать в трей при закрытии");
+            trayCheck.Checked = true;
+            updatesCheck = NewCheck("Проверять обновления при запуске");
+            autostartCheck.Click += OnAutostartClick;
+            autoEnableCheck.CheckedChanged += delegate { SaveState(); };
+            trayCheck.CheckedChanged += delegate { SaveState(); };
+            updatesCheck.Click += delegate
+            {
+                CheckUpdatesEnabled = updatesCheck.Checked;
+                Log("Проверка обновлений при запуске: " + (updatesCheck.Checked ? "включена." : "выключена."));
+            };
+            CheckCard(t, autostartCheck, "Программа стартует при входе в Windows (через планировщик задач, с правами администратора).");
+            CheckCard(t, autoEnableCheck, "Обход включается сам, как только программа запустилась.");
+            CheckCard(t, trayCheck, "Кнопка закрытия окна прячет программу в область уведомлений, обход продолжает работать.");
+
+SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard(t, updatesCheck, "При запуске программа тихо проверит наличие новой версии и покажет уведомление.");
+            SectionHeader(t, "VPN", SectionGap - Gap);
+            Button reset = new Button();
+            reset.Text = "Сбросить WARP-аккаунт";
+            reset.AutoSize = true;
+            reset.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            reset.Padding = new Padding(6, 0, 6, 0);
+            reset.Click += delegate { ResetWarp(); };
+            ValueCard(t, "Аккаунт Cloudflare WARP", reset, "У каждого пользователя свой аккаунт, он создаётся автоматически при первом включении VPN. Если туннель перестал работать, сбросьте аккаунт.");
         }
 
         CheckBox NewCheck(string text)
@@ -2106,7 +2351,7 @@ namespace ZapretGUI
             CheckBox c = new CheckBox();
             c.Text = text;
             c.AutoSize = true;
-            c.Margin = new Padding(3, 3, 3, 3);
+            c.Margin = new Padding(0, 4, 0, 0);
             return c;
         }
 
@@ -2325,6 +2570,7 @@ namespace ZapretGUI
             secureDnsCheck.Checked = GetBool(ini, "secureDns", false);
             trayDnsItem.Checked = secureDnsCheck.Checked;
             checkUpdates = GetBool(ini, "check_updates", true); // default on; replaces the old utils\check_updates.enabled flag
+            updatesCheck.Checked = checkUpdates;
             try
             {
                 string oldFlag = Path.Combine(Core.Root, "utils\\check_updates.enabled");
@@ -2373,9 +2619,9 @@ namespace ZapretGUI
         {
             bool on = IsRunning;
             toggleButton.Text = on ? "ВЫКЛЮЧИТЬ" : "ВКЛЮЧИТЬ";
-            toggleButton.BackColor = on ? Color.FromArgb(200, 60, 55) : Color.FromArgb(46, 160, 70);
-            statusLabel.Text = on ? "Обход: включён (" + (current != null ? current.Display : "") + ")" + (tgUp ? " + VPN" : "") : "Обход: выключен";
-            statusLabel.ForeColor = on ? Color.FromArgb(30, 130, 50) : Color.DimGray;
+            toggleButton.BackColor = on ? Color.FromArgb(198, 40, 40) : Color.FromArgb(46, 125, 50);
+            statusLabel.Text = on ? "Обход включён — стратегия " + (current != null ? current.Display : "") + (tgUp ? " + VPN" : "") : "Обход выключен";
+            statusDot.ForeColor = on ? Color.FromArgb(46, 160, 70) : Color.FromArgb(150, 150, 150);
             Icon ic = on ? iconOn : iconOff;
             Icon = ic;
             tray.Icon = ic;
@@ -2511,17 +2757,7 @@ namespace ZapretGUI
 
         void KillOthers()
         {
-            foreach (Process p in Process.GetProcessesByName("winws"))
-            {
-                try
-                {
-                    Log("Найден winws.exe (PID " + p.Id + "), завершаю.");
-                    p.Kill();
-                    p.WaitForExit(3000);
-                }
-                catch (Exception ex) { Log("Не удалось завершить winws.exe: " + ex.Message); }
-                finally { p.Dispose(); }
-            }
+            Core.KillWinws(Log);
         }
 
         void Start()
@@ -2691,15 +2927,7 @@ namespace ZapretGUI
 
         bool DeleteTask()
         {
-            try
-            {
-                int code;
-                string o = Core.RunTool("schtasks.exe", "/Delete /TN " + Core.TaskName + " /F", out code);
-                if (code != 0) { Log("schtasks /Delete: " + o); return false; }
-                Log("Автозапуск отключён.");
-                return true;
-            }
-            catch (Exception ex) { Log("Ошибка удаления автозапуска: " + ex.Message); return false; }
+            return Core.DeleteTask(Log);
         }
     }
 
@@ -3041,7 +3269,6 @@ namespace ZapretGUI
         TableLayoutPanel stack;
         RichTextBox results;
         Label statusText, fakesCurrentLabel, ipsetModeLabel;
-        CheckBox updatesCheck;
         RadioButton rbLoaded, rbNone, rbAny;
         ComboBox fakeTypeBox, fakeFileBox;
         readonly List<Control> ops = new List<Control>();
@@ -3474,26 +3701,7 @@ namespace ZapretGUI
 
         void BuildUpdates()
         {
-            FlowLayoutPanel s = Section("Обновления и WARP");
-            Desc(s, "Установка обновлений zapret выполняется с вкладки «Главная» (кнопка «Проверить обновления»).");
-            Btn(Row(s), "Проверить обновления", delegate { main.CheckForUpdates(); });
-            updatesCheck = new CheckBox();
-            updatesCheck.Text = "Проверять обновления при запуске";
-            updatesCheck.AutoSize = true;
-            updatesCheck.Margin = new Padding(3, 4, 3, 3);
-            updatesCheck.Checked = main.CheckUpdatesEnabled;
-            updatesCheck.Click += delegate
-            {
-                main.CheckUpdatesEnabled = updatesCheck.Checked;
-                Out("[OK] Проверка при запуске: " + (updatesCheck.Checked ? "включена." : "выключена."));
-            };
-            s.Controls.Add(updatesCheck);
-            Desc(s, "Для VPN (Telegram, YouTube) у каждого пользователя свой аккаунт Cloudflare WARP (создаётся автоматически).");
-            Btn(Row(s), "Сбросить WARP-аккаунт", delegate
-            {
-                main.ResetWarp();
-                Out("[OK] Запрошен сброс WARP-аккаунта.");
-            });
+            // Update settings and the WARP reset moved to the "Настройки" tab; the update button lives on "Главная".
         }
 
         public void StartupRefresh()
@@ -3843,12 +4051,91 @@ namespace ZapretGUI
         }
     }
 
+    // ZapretGUI.exe --cleanup: headless removal of everything the GUI leaves on the system (used by unlocker.bat).
+    // Does not touch the "zapret" Windows service (the bat handles it). Exit code 0 = ok, 1 = something failed.
+    static class CleanupMode
+    {
+        static readonly StringBuilder log = new StringBuilder();
+
+        static void L(string msg)
+        {
+            log.Append("[").Append(DateTime.Now.ToString("HH:mm:ss")).Append("] ").Append(msg).Append("\r\n");
+        }
+
+        public static int Run()
+        {
+            bool ok = true;
+            L("Очистка запущена.");
+            try { if (!Core.KillWinws(L)) ok = false; }
+            catch (Exception ex) { ok = false; L("winws: " + ex.Message); }
+
+            try { if (!Core.TgTeardown(L)) ok = false; }
+            catch (Exception ex) { ok = false; L("Туннель: " + ex.Message); }
+
+            try
+            {
+                DnsResult r = SecureDns.Restore();
+                foreach (string s in r.Info) L(s);
+                foreach (string s in r.Errors) L("[!] " + s);
+                if (!r.Ok || r.Errors.Count > 0) ok = false;
+            }
+            catch (Exception ex) { ok = false; L("DNS: " + ex.Message); }
+
+            try
+            {
+                int code;
+                Core.RunTool("schtasks.exe", "/Query /TN " + Core.TaskName, out code);
+                if (code == 0) { if (!Core.DeleteTask(L)) ok = false; }
+                else L("Задача автозапуска не найдена.");
+            }
+            catch (Exception ex) { ok = false; L("Автозапуск: " + ex.Message); }
+
+            try { if (!RemoveWinDivert()) ok = false; }
+            catch (Exception ex) { ok = false; L("WinDivert: " + ex.Message); }
+
+            L(ok ? "Готово." : "Завершено с ошибками.");
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ZapretGUI");
+                Directory.CreateDirectory(dir);
+                File.WriteAllText(Path.Combine(dir, "cleanup.log"), log.ToString(), new UTF8Encoding(true));
+            }
+            catch (Exception) { }
+            return ok ? 0 : 1;
+        }
+
+        static bool RemoveWinDivert()
+        {
+            if (Core.ServiceState("zapret") == "RUNNING")
+            {
+                L("Служба zapret запущена: драйвер WinDivert оставлен.");
+                return true;
+            }
+            bool ok = true;
+            foreach (string name in new string[] { "WinDivert", "WinDivert14" })
+            {
+                if (Core.ServiceState(name) == null) continue;
+                int code;
+                string o = Core.RunTool("sc.exe", "stop " + name, out code);
+                L("sc stop " + name + ": код " + code);
+                for (int i = 0; i < 20 && Core.ServiceState(name) == "RUNNING"; i++) Thread.Sleep(250);
+                o = Core.RunTool("sc.exe", "delete " + name, out code);
+                L("sc delete " + name + ": код " + code);
+                if (code != 0 && code != 1060 && code != 1072) { ok = false; L(o.Trim()); }
+            }
+            return ok;
+        }
+    }
+
     static class Program
     {
         [STAThread]
         static int Main(string[] argv)
         {
             Core.Root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
+
+            foreach (string a in argv)
+                if (a == "--cleanup") return CleanupMode.Run();
 
             bool tray = false, afterUpdate = false, resume = false;
             int waitPid = 0;
@@ -3871,21 +4158,35 @@ namespace ZapretGUI
             }
 
             bool createdNew;
+#if PREVIEW
+            Mutex mutex = new Mutex(true, MutexNameStatic + "_Preview", out createdNew);
+            EventWaitHandle evt = new EventWaitHandle(false, EventResetMode.AutoReset, "ZapretGUI_ShowWindow_Event_Preview");
+#else
             Mutex mutex = new Mutex(true, MutexNameStatic, out createdNew);
             EventWaitHandle evt = new EventWaitHandle(false, EventResetMode.AutoReset, "ZapretGUI_ShowWindow_Event");
+#endif
             if (!createdNew)
             {
                 evt.Set();
                 return 0;
             }
 
+#if !PREVIEW
             Updater.CleanOld(Core.Root);
+#endif
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             try
             {
-                Application.Run(new MainForm(evt, tray, afterUpdate, resume));
+                MainForm form = new MainForm(evt, tray, afterUpdate, resume);
+#if PREVIEW
+                foreach (string a in argv)
+                    if (a.StartsWith("--tab=")) form.PreviewTab(int.Parse(a.Substring(6)));
+                foreach (string a in argv)
+                    if (a.StartsWith("--size=")) { string[] wh = a.Substring(7).Split('x'); form.PreviewSize(int.Parse(wh[0]), int.Parse(wh[1])); }
+#endif
+                Application.Run(form);
             }
             catch (Exception ex)
             {
