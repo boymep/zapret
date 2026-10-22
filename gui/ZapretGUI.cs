@@ -440,6 +440,613 @@ namespace ZapretGUI
         }
     }
 
+    // ---------- Secure DNS: Cloudflare over HTTPS (DoH) on physical adapters, with exact restore ----------
+
+    class DnsAdapter
+    {
+        public string Id;      // "{GUID}"
+        public string Name;    // display only, never used in commands
+        public int V4Index = -1;
+        public int V6Index = -1;
+    }
+
+    class DnsResult
+    {
+        public bool Ok;
+        public List<string> Info = new List<string>();
+        public List<string> Errors = new List<string>();
+    }
+
+    static class SecureDns
+    {
+        const string TemplateUrl = "https://cloudflare-dns.com/dns-query";
+        static readonly string[] V4Servers = { "1.1.1.1", "1.0.0.1" };
+        static readonly string[] V6Servers = { "2606:4700:4700::1111", "2606:4700:4700::1001" };
+        const string Tcpip4 = @"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\";
+        const string Tcpip6 = @"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\";
+        const string DnsParams = @"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters";
+        const string IfaceBase = @"SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\";
+        const string GlobalSection = "global";
+        static readonly object Gate = new object();
+
+        static readonly string[] ExcludedWords = { "hyper-v", "virtual", "wireguard", "wintun", "happ", "outline", "amneziawg", "zapret", "vpn", "loopback" };
+
+        static string BackupPath() { return Path.Combine(Core.SecureDataDir(), "dns-backup.ini"); }
+
+        // ---------- backup file: [section] + key=value ----------
+
+        class Backup
+        {
+            public Dictionary<string, Dictionary<string, string>> Sections = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+            public static Backup Load()
+            {
+                Backup b = new Backup();
+                string path = BackupPath();
+                if (!File.Exists(path)) return b;
+                Dictionary<string, string> cur = null;
+                foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string line = raw.Trim();
+                    if (line.Length == 0) continue;
+                    if (line.StartsWith("[") && line.EndsWith("]"))
+                    {
+                        cur = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        b.Sections[line.Substring(1, line.Length - 2)] = cur;
+                        continue;
+                    }
+                    int i = line.IndexOf('=');
+                    if (cur != null && i > 0) cur[line.Substring(0, i).Trim()] = line.Substring(i + 1).Trim();
+                }
+                return b;
+            }
+
+            public void Save()
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (KeyValuePair<string, Dictionary<string, string>> s in Sections)
+                {
+                    sb.AppendLine("[" + s.Key + "]");
+                    foreach (KeyValuePair<string, string> kv in s.Value) sb.AppendLine(kv.Key + "=" + kv.Value);
+                }
+                File.WriteAllText(BackupPath(), sb.ToString(), new UTF8Encoding(false));
+            }
+
+            public bool HasAdapters()
+            {
+                foreach (string k in Sections.Keys) if (!k.Equals(GlobalSection, StringComparison.OrdinalIgnoreCase)) return true;
+                return false;
+            }
+        }
+
+        static string Get(Dictionary<string, string> d, string key)
+        {
+            string v;
+            return d.TryGetValue(key, out v) ? v : "";
+        }
+
+        static bool ValidGuid(string id)
+        {
+            return id != null && Regex.IsMatch(id, @"^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$");
+        }
+
+        // ---------- adapters ----------
+
+        static DnsAdapter ToAdapter(System.Net.NetworkInformation.NetworkInterface ni)
+        {
+            DnsAdapter a = new DnsAdapter();
+            a.Id = ni.Id;
+            a.Name = ni.Name;
+            try
+            {
+                System.Net.NetworkInformation.IPInterfaceProperties ip = ni.GetIPProperties();
+                if (ni.Supports(System.Net.NetworkInformation.NetworkInterfaceComponent.IPv4))
+                {
+                    try { a.V4Index = ip.GetIPv4Properties().Index; } catch (Exception) { }
+                }
+                if (ni.Supports(System.Net.NetworkInformation.NetworkInterfaceComponent.IPv6))
+                {
+                    try { a.V6Index = ip.GetIPv6Properties().Index; } catch (Exception) { }
+                }
+            }
+            catch (Exception) { }
+            return a;
+        }
+
+        // Up, Ethernet/Wi-Fi, with a default gateway, not virtual/VPN.
+        public static List<DnsAdapter> FindAdapters()
+        {
+            List<DnsAdapter> r = new List<DnsAdapter>();
+            foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                try
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    System.Net.NetworkInformation.NetworkInterfaceType t = ni.NetworkInterfaceType;
+                    if (t != System.Net.NetworkInformation.NetworkInterfaceType.Ethernet &&
+                        t != System.Net.NetworkInformation.NetworkInterfaceType.Wireless80211 &&
+                        t != System.Net.NetworkInformation.NetworkInterfaceType.GigabitEthernet) continue;
+                    string text = (ni.Name + " " + ni.Description).ToLowerInvariant();
+                    bool bad = Regex.IsMatch(text, @"\btap\b");
+                    foreach (string w in ExcludedWords) if (text.Contains(w)) bad = true;
+                    if (bad) continue;
+                    bool gw = false;
+                    foreach (System.Net.NetworkInformation.GatewayIPAddressInformation g in ni.GetIPProperties().GatewayAddresses)
+                        if (!System.Net.IPAddress.Any.Equals(g.Address) && !System.Net.IPAddress.IPv6Any.Equals(g.Address)) gw = true;
+                    if (!gw) continue;
+                    if (!ValidGuid(ni.Id)) continue;
+                    DnsAdapter a = ToAdapter(ni);
+                    if (a.V4Index < 0 && a.V6Index < 0) continue;
+                    r.Add(a);
+                }
+                catch (Exception) { }
+            }
+            return r;
+        }
+
+        // Any adapter (even down) by GUID, for restore.
+        static DnsAdapter FindById(string id)
+        {
+            foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                if (string.Equals(ni.Id, id, StringComparison.OrdinalIgnoreCase)) return ToAdapter(ni);
+            return null;
+        }
+
+        // ---------- registry helpers ----------
+
+        static string ReadNameServer(string baseKey, string id, out bool keyExists)
+        {
+            using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(baseKey + id))
+            {
+                keyExists = k != null;
+                if (k == null) return "";
+                string v = k.GetValue("NameServer") as string;
+                return v == null ? "" : v.Trim();
+            }
+        }
+
+        static void WriteNameServer(string baseKey, string id, string value)
+        {
+            using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(baseKey + id, true))
+            {
+                if (k != null) k.SetValue("NameServer", value, Microsoft.Win32.RegistryValueKind.String);
+            }
+        }
+
+        static string DohPath(string id, bool v6, string server)
+        {
+            return IfaceBase + id + @"\DohInterfaceSettings\" + (v6 ? "Doh6" : "Doh") + "\\" + server;
+        }
+
+        // "-" key absent, "x" key present without DohFlags, otherwise the DohFlags number.
+        static string ReadDohState(string path)
+        {
+            using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(path))
+            {
+                if (k == null) return "-";
+                object v = k.GetValue("DohFlags");
+                if (v is int) return ((int)v).ToString();
+                return "x";
+            }
+        }
+
+        static void WriteDohFlags(string path, int flags)
+        {
+            using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(path))
+            {
+                k.SetValue("DohFlags", flags, Microsoft.Win32.RegistryValueKind.DWord);
+            }
+        }
+
+        static void RestoreDohState(string path, string state)
+        {
+            if (state == "-" || state.Length == 0)
+            {
+                Microsoft.Win32.Registry.LocalMachine.DeleteSubKeyTree(path, false);
+            }
+            else if (state == "x")
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(path, true))
+                {
+                    if (k != null) k.DeleteValue("DohFlags", false);
+                }
+            }
+            else
+            {
+                int n;
+                if (int.TryParse(state, out n)) WriteDohFlags(path, n);
+            }
+        }
+
+        static void DeleteIfEmpty(string path)
+        {
+            try
+            {
+                bool empty;
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(path))
+                {
+                    if (k == null) return;
+                    empty = k.SubKeyCount == 0 && k.ValueCount == 0;
+                }
+                if (empty) Microsoft.Win32.Registry.LocalMachine.DeleteSubKey(path, false);
+            }
+            catch (Exception) { }
+        }
+
+        static void CleanDohParents(string id)
+        {
+            string b = IfaceBase + id + @"\DohInterfaceSettings";
+            DeleteIfEmpty(b + @"\Doh");
+            DeleteIfEmpty(b + @"\Doh6");
+            DeleteIfEmpty(b);
+        }
+
+        // ---------- netsh ----------
+
+        static bool Netsh(string args, List<string> errors, string what)
+        {
+            int code;
+            string o = Core.RunTool("netsh.exe", args, out code);
+            if (code != 0)
+            {
+                string first = o;
+                int nl = first.IndexOf('\n');
+                if (nl > 0) first = first.Substring(0, nl);
+                errors.Add(what + ": " + first.Trim() + " (код " + code + ")");
+                return false;
+            }
+            return true;
+        }
+
+        static void Flush()
+        {
+            int code;
+            try { Core.RunTool("ipconfig.exe", "/flushdns", out code); } catch (Exception) { }
+        }
+
+        static bool ListHas(string text, string ip)
+        {
+            return Regex.IsMatch(text, @"(?<![0-9A-Fa-f:.])" + Regex.Escape(ip) + @"(?![0-9A-Fa-f:.])", RegexOptions.IgnoreCase);
+        }
+
+        static List<string> ParseServers(string ns)
+        {
+            List<string> r = new List<string>();
+            foreach (string p in ns.Split(new char[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                System.Net.IPAddress ip;
+                if (System.Net.IPAddress.TryParse(p, out ip)) r.Add(ip.ToString());
+            }
+            return r;
+        }
+
+        // ---------- apply ----------
+
+        static Dictionary<string, string> Snapshot(DnsAdapter a)
+        {
+            Dictionary<string, string> s = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            s["name"] = a.Name.Replace("\r", " ").Replace("\n", " ");
+            bool ex;
+            string ns4 = ReadNameServer(Tcpip4, a.Id, out ex);
+            s["v4"] = a.V4Index >= 0 ? "1" : "0";
+            s["v4static"] = ns4.Length > 0 ? "1" : "0";
+            s["v4ns"] = ns4;
+            string ns6 = ReadNameServer(Tcpip6, a.Id, out ex);
+            s["v6"] = a.V6Index >= 0 ? "1" : "0";
+            s["v6static"] = ns6.Length > 0 ? "1" : "0";
+            s["v6ns"] = ns6;
+            foreach (string sv in V4Servers) s["doh." + sv] = ReadDohState(DohPath(a.Id, false, sv));
+            foreach (string sv in V6Servers) s["doh6." + sv] = ReadDohState(DohPath(a.Id, true, sv));
+            return s;
+        }
+
+        static bool ApplyAdapter(DnsAdapter a, List<string> errors)
+        {
+            string who = "«" + a.Name + "»";
+            if (a.V4Index >= 0)
+            {
+                string idx = a.V4Index.ToString();
+                if (!Netsh("interface ipv4 set dnsservers " + idx + " static " + V4Servers[0] + " primary validate=no", errors, who + " IPv4 DNS")) return false;
+                if (!Netsh("interface ipv4 add dnsservers " + idx + " " + V4Servers[1] + " index=2 validate=no", errors, who + " IPv4 DNS 2")) return false;
+            }
+            if (a.V6Index >= 0)
+            {
+                string idx = a.V6Index.ToString();
+                if (!Netsh("interface ipv6 set dnsservers " + idx + " static " + V6Servers[0] + " primary validate=no", errors, who + " IPv6 DNS")) return false;
+                if (!Netsh("interface ipv6 add dnsservers " + idx + " " + V6Servers[1] + " index=2 validate=no", errors, who + " IPv6 DNS 2")) return false;
+            }
+            try
+            {
+                foreach (string sv in V4Servers) WriteDohFlags(DohPath(a.Id, false, sv), 1);
+                if (a.V6Index >= 0)
+                    foreach (string sv in V6Servers) WriteDohFlags(DohPath(a.Id, true, sv), 1);
+            }
+            catch (Exception ex)
+            {
+                errors.Add(who + " DoH: " + ex.Message);
+                return false;
+            }
+            return true;
+        }
+
+        static bool RegisterTemplates(Dictionary<string, string> global, bool recordExisting, List<string> errors)
+        {
+            int code;
+            string shown = Core.RunTool("netsh.exe", "dns show encryption", out code);
+            List<string> all = new List<string>(V4Servers);
+            all.AddRange(V6Servers);
+            foreach (string sv in all)
+            {
+                bool existed = ListHas(shown, sv);
+                if (recordExisting) global["tpl." + sv] = existed ? "1" : "0";
+                string tail = " server=" + sv + " dohtemplate=" + TemplateUrl + " autoupgrade=yes udpfallback=no";
+                List<string> tmp = new List<string>();
+                bool ok = Netsh("dns " + (existed ? "set" : "add") + " encryption" + tail, tmp, "Шаблон DoH " + sv);
+                if (!ok) ok = Netsh("dns " + (existed ? "add" : "set") + " encryption" + tail, tmp, "Шаблон DoH " + sv);
+                if (!ok) { errors.AddRange(tmp); return false; }
+            }
+            return true;
+        }
+
+        public static DnsResult Apply()
+        {
+            lock (Gate)
+            {
+                DnsResult res = new DnsResult();
+                try
+                {
+                    int code;
+                    Core.RunTool("netsh.exe", "dns show encryption", out code);
+                    if (code != 0)
+                    {
+                        res.Errors.Add("Эта версия Windows не поддерживает DNS через HTTPS (нужна Windows 10 21H2 или новее / Windows 11). Настройки не изменены.");
+                        return res;
+                    }
+                    List<DnsAdapter> adapters = FindAdapters();
+                    Backup bk = Backup.Load();
+                    if (adapters.Count == 0 && !bk.HasAdapters())
+                    {
+                        res.Errors.Add("Не найдено подходящих физических сетевых адаптеров (Ethernet/Wi-Fi со шлюзом). Настройки не изменены.");
+                        return res;
+                    }
+
+                    bool newGlobal = !bk.Sections.ContainsKey(GlobalSection);
+                    if (newGlobal)
+                    {
+                        Dictionary<string, string> g = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(DnsParams))
+                        {
+                            object v = k == null ? null : k.GetValue("EnableAutoDoh");
+                            g["autoDoh"] = v is int ? ((int)v).ToString() : "absent";
+                        }
+                        bk.Sections[GlobalSection] = g;
+                    }
+                    // Backup is written before any change (templates are recorded inside RegisterTemplates).
+                    List<string> terr = new List<string>();
+                    Dictionary<string, string> glob = bk.Sections[GlobalSection];
+                    if (newGlobal) bk.Save();
+                    if (!RegisterTemplates(glob, newGlobal, terr))
+                    {
+                        res.Errors.AddRange(terr);
+                        if (newGlobal) { bk.Save(); RestoreGlobal(bk, res.Errors); }
+                        return res;
+                    }
+                    if (newGlobal) bk.Save();
+
+                    int okCount = 0;
+                    foreach (DnsAdapter a in adapters)
+                    {
+                        if (!bk.Sections.ContainsKey(a.Id))
+                        {
+                            bk.Sections[a.Id] = Snapshot(a);
+                            bk.Save();
+                        }
+                        List<string> errs = new List<string>();
+                        if (ApplyAdapter(a, errs))
+                        {
+                            okCount++;
+                            res.Info.Add("DNS через HTTPS включён на «" + a.Name + "».");
+                        }
+                        else
+                        {
+                            res.Errors.AddRange(errs);
+                            List<string> rerr = new List<string>();
+                            if (RestoreAdapter(a.Id, bk.Sections[a.Id], rerr))
+                            {
+                                bk.Sections.Remove(a.Id);
+                                bk.Save();
+                                res.Errors.Add("Изменения на «" + a.Name + "» откатены.");
+                            }
+                            else res.Errors.AddRange(rerr);
+                        }
+                    }
+
+                    if (okCount > 0)
+                    {
+                        try
+                        {
+                            using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(DnsParams))
+                                k.SetValue("EnableAutoDoh", 2, Microsoft.Win32.RegistryValueKind.DWord);
+                        }
+                        catch (Exception ex) { res.Errors.Add("EnableAutoDoh: " + ex.Message); }
+                        Flush();
+                        res.Ok = true;
+                    }
+                    else if (!bk.HasAdapters())
+                    {
+                        RestoreGlobal(bk, res.Errors);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    res.Errors.Add("Ошибка: " + ex.Message);
+                }
+                return res;
+            }
+        }
+
+        // ---------- restore ----------
+
+        static bool RestoreFamily(DnsAdapter a, Dictionary<string, string> s, bool v6, List<string> errors)
+        {
+            string fam = v6 ? "ipv6" : "ipv4";
+            if (Get(s, v6 ? "v6" : "v4") != "1") return true; // protocol was not present before
+            bool wasStatic = Get(s, v6 ? "v6static" : "v4static") == "1";
+            List<string> list = ParseServers(Get(s, v6 ? "v6ns" : "v4ns"));
+            int idx = a == null ? -1 : (v6 ? a.V6Index : a.V4Index);
+            string i = idx.ToString();
+            if (!wasStatic || list.Count == 0)
+                return Netsh("interface " + fam + " set dnsservers " + i + " source=dhcp", errors, "Восстановление " + fam + " DNS");
+            if (!Netsh("interface " + fam + " set dnsservers " + i + " static " + list[0] + " primary validate=no", errors, "Восстановление " + fam + " DNS")) return false;
+            for (int n = 1; n < list.Count; n++)
+                if (!Netsh("interface " + fam + " add dnsservers " + i + " " + list[n] + " index=" + (n + 1) + " validate=no", errors, "Восстановление " + fam + " DNS")) return false;
+            return true;
+        }
+
+        static bool RestoreAdapter(string id, Dictionary<string, string> s, List<string> errors)
+        {
+            bool ok = true;
+            try
+            {
+                if (!ValidGuid(id)) { errors.Add("Некорректный идентификатор адаптера в резервной копии."); return false; }
+                DnsAdapter a = FindById(id);
+                string name = Get(s, "name");
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    bool v6 = pass == 1;
+                    if (Get(s, v6 ? "v6" : "v4") != "1") continue;
+                    int idx = a == null ? -1 : (v6 ? a.V6Index : a.V4Index);
+                    if (idx >= 0)
+                    {
+                        if (!RestoreFamily(a, s, v6, errors)) ok = false;
+                    }
+                    else
+                    {
+                        // adapter is absent: write the saved value straight into the registry
+                        List<string> list = ParseServers(Get(s, v6 ? "v6ns" : "v4ns"));
+                        string value = Get(s, v6 ? "v6static" : "v4static") == "1" ? string.Join(",", list.ToArray()) : "";
+                        try { WriteNameServer(v6 ? Tcpip6 : Tcpip4, id, value); }
+                        catch (Exception ex) { errors.Add("«" + name + "» реестр DNS: " + ex.Message); ok = false; }
+                    }
+                }
+                try
+                {
+                    foreach (string sv in V4Servers) RestoreDohState(DohPath(id, false, sv), Get(s, "doh." + sv));
+                    foreach (string sv in V6Servers) RestoreDohState(DohPath(id, true, sv), Get(s, "doh6." + sv));
+                    CleanDohParents(id);
+                }
+                catch (Exception ex) { errors.Add("«" + name + "» ключи DoH: " + ex.Message); ok = false; }
+            }
+            catch (Exception ex)
+            {
+                errors.Add("Восстановление: " + ex.Message);
+                ok = false;
+            }
+            return ok;
+        }
+
+        // EnableAutoDoh and the templates we added.
+        static bool RestoreGlobal(Backup bk, List<string> errors)
+        {
+            Dictionary<string, string> g;
+            if (!bk.Sections.TryGetValue(GlobalSection, out g)) return true;
+            bool ok = true;
+            try
+            {
+                string v = Get(g, "autoDoh");
+                int n;
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(DnsParams))
+                {
+                    if (int.TryParse(v, out n)) k.SetValue("EnableAutoDoh", n, Microsoft.Win32.RegistryValueKind.DWord);
+                    else if (v == "absent") k.DeleteValue("EnableAutoDoh", false);
+                }
+            }
+            catch (Exception ex) { errors.Add("EnableAutoDoh: " + ex.Message); ok = false; }
+            List<string> all = new List<string>(V4Servers);
+            all.AddRange(V6Servers);
+            foreach (string sv in all)
+                if (Get(g, "tpl." + sv) == "0")
+                    if (!Netsh("dns delete encryption server=" + sv, errors, "Удаление шаблона DoH " + sv)) ok = false;
+            if (ok)
+            {
+                bk.Sections.Remove(GlobalSection);
+                if (bk.Sections.Count == 0) { try { File.Delete(BackupPath()); } catch (Exception) { } }
+                else bk.Save();
+            }
+            return ok;
+        }
+
+        public static DnsResult Restore()
+        {
+            lock (Gate)
+            {
+                DnsResult res = new DnsResult();
+                try
+                {
+                    Backup bk = Backup.Load();
+                    if (bk.Sections.Count == 0)
+                    {
+                        res.Ok = true;
+                        res.Info.Add("Резервной копии DNS нет: восстанавливать нечего.");
+                        return res;
+                    }
+                    bool all = true;
+                    List<string> ids = new List<string>(bk.Sections.Keys);
+                    foreach (string id in ids)
+                    {
+                        if (id.Equals(GlobalSection, StringComparison.OrdinalIgnoreCase)) continue;
+                        List<string> errs = new List<string>();
+                        string name = Get(bk.Sections[id], "name");
+                        if (RestoreAdapter(id, bk.Sections[id], errs))
+                        {
+                            bk.Sections.Remove(id);
+                            bk.Save();
+                            res.Info.Add("DNS восстановлен на «" + name + "».");
+                        }
+                        else { all = false; res.Errors.AddRange(errs); }
+                    }
+                    if (all)
+                    {
+                        if (!RestoreGlobal(bk, res.Errors)) all = false;
+                    }
+                    Flush();
+                    res.Ok = all;
+                    if (!all) res.Errors.Add("Часть настроек не восстановлена, резервная копия сохранена: " + BackupPath());
+                }
+                catch (Exception ex)
+                {
+                    res.Errors.Add("Ошибка: " + ex.Message);
+                }
+                return res;
+            }
+        }
+
+        // ---------- status ----------
+
+        public static string StatusText()
+        {
+            try
+            {
+                bool on = false;
+                try { on = Backup.Load().HasAdapters(); } catch (Exception) { }
+                StringBuilder sb = new StringBuilder();
+                sb.Append("Защищённый DNS (DoH): " + (on ? "включён" : "выключен"));
+                List<DnsAdapter> found = FindAdapters();
+                foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    bool match = false;
+                    foreach (DnsAdapter a in found) if (string.Equals(a.Id, ni.Id, StringComparison.OrdinalIgnoreCase)) match = true;
+                    if (!match) continue;
+                    List<string> ips = new List<string>();
+                    foreach (System.Net.IPAddress ip in ni.GetIPProperties().DnsAddresses) ips.Add(ip.ToString());
+                    sb.Append("\nDNS «" + ni.Name + "»: " + (ips.Count > 0 ? string.Join(", ", ips.ToArray()) : "нет"));
+                }
+                return sb.ToString();
+            }
+            catch (Exception ex) { return "Защищённый DNS: не удалось определить (" + ex.Message + ")"; }
+        }
+    }
+
     // ---------- Curve25519 (RFC 7748) for WireGuard keys ----------
 
     static class Curve25519
@@ -887,6 +1494,10 @@ namespace ZapretGUI
         ComboBox strategyBox;
         ComboBox gameBox;
         CheckBox autostartCheck, autoEnableCheck, trayCheck;
+        CheckBox secureDnsCheck;
+        ToolTip dnsTip;
+        bool secureDnsBusy;
+        ToolStripMenuItem trayDnsItem;
         TextBox logBox;
         NotifyIcon tray;
         ContextMenuStrip trayMenu;
@@ -934,6 +1545,7 @@ namespace ZapretGUI
                 BeginInvoke(new MethodInvoker(delegate { Start(); }));
             serviceTab.StartupRefresh();
             TgRefreshAsync();
+            if (secureDnsCheck.Checked) SecureDnsRun(true, true);
             if (afterUpdate)
             {
                 Log("Обновлено до версии " + Core.LocalVersion());
@@ -1375,6 +1987,12 @@ namespace ZapretGUI
             AddRow(t, autostartCheck, 0);
             AddRow(t, autoEnableCheck, 0);
             AddRow(t, trayCheck, 0);
+            secureDnsCheck = NewCheck("Защищённый DNS (DoH через Cloudflare)");
+            secureDnsCheck.Click += delegate { SecureDnsRun(secureDnsCheck.Checked, false); };
+            dnsTip = new ToolTip();
+            dnsTip.AutoPopDelay = 30000;
+            dnsTip.SetToolTip(secureDnsCheck, "Провайдер может подменять DNS-ответы (например, для youtube.com). Включает DNS через HTTPS 1.1.1.1 для всей Windows. При выключении прежние настройки DNS восстанавливаются.");
+            AddRow(t, secureDnsCheck, 0);
 
             // Telegram split tunnel group
             GroupBox tg = new GroupBox();
@@ -1517,6 +2135,10 @@ namespace ZapretGUI
             trayYtItem.CheckOnClick = true;
             trayYtItem.Click += delegate { ytCheck.Checked = trayYtItem.Checked; };
             trayMenu.Items.Add(trayYtItem);
+            trayDnsItem = new ToolStripMenuItem("Защищённый DNS (DoH)");
+            trayDnsItem.CheckOnClick = true;
+            trayDnsItem.Click += delegate { secureDnsCheck.Checked = trayDnsItem.Checked; SecureDnsRun(trayDnsItem.Checked, false); };
+            trayMenu.Items.Add(trayDnsItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exit);
 
@@ -1630,6 +2252,51 @@ namespace ZapretGUI
             return v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
         }
 
+        // ---------- secure DNS (DoH via Cloudflare) ----------
+
+        void SecureDnsRun(bool want, bool silent)
+        {
+            if (secureDnsBusy) return;
+            secureDnsBusy = true;
+            secureDnsCheck.Enabled = false;
+            trayDnsItem.Enabled = false;
+            Log(want ? "Защищённый DNS: включение..." : "Защищённый DNS: восстановление прежних настроек...");
+            Thread th = new Thread((ThreadStart)delegate
+            {
+                DnsResult r;
+                try { r = want ? SecureDns.Apply() : SecureDns.Restore(); }
+                catch (Exception ex) { r = new DnsResult(); r.Errors.Add("Ошибка: " + ex.Message); }
+                UiPost(delegate { SecureDnsDone(want, silent, r); });
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void SecureDnsDone(bool want, bool silent, DnsResult r)
+        {
+            foreach (string s in r.Info) Log(s);
+            foreach (string s in r.Errors) Log("[!] " + s);
+            bool state;
+            if (r.Ok) state = want;
+            else if (want) state = silent; // silent startup failure: keep the setting and retry next launch
+            else state = true;             // restore failed: backup is kept, setting stays on
+            secureDnsCheck.Checked = state;
+            trayDnsItem.Checked = state;
+            secureDnsCheck.Enabled = true;
+            trayDnsItem.Enabled = true;
+            secureDnsBusy = false;
+            SaveState();
+            if (r.Errors.Count > 0)
+            {
+                string text = "Защищённый DNS: " + string.Join("\n", r.Errors.ToArray());
+                if (silent) Balloon("Защищённый DNS: ошибка, подробности в журнале.");
+                else MessageBox.Show(this, text, "Zapret GUI", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            else if (!silent)
+                Balloon(want ? "Защищённый DNS включён." : "Прежние настройки DNS восстановлены.");
+            if (r.Ok) Log(want ? "Защищённый DNS включён." : "Прежние настройки DNS восстановлены.");
+        }
+
         void LoadState()
         {
             Dictionary<string, string> ini = Core.LoadIni();
@@ -1655,6 +2322,8 @@ namespace ZapretGUI
             trayCheck.Checked = GetBool(ini, "closeToTray", true);
             tgCheck.Checked = GetBool(ini, "tgEnabled", false);
             ytCheck.Checked = GetBool(ini, "ytEnabled", false);
+            secureDnsCheck.Checked = GetBool(ini, "secureDns", false);
+            trayDnsItem.Checked = secureDnsCheck.Checked;
             checkUpdates = GetBool(ini, "check_updates", true); // default on; replaces the old utils\check_updates.enabled flag
             try
             {
@@ -1684,6 +2353,7 @@ namespace ZapretGUI
                 d["closeToTray"] = trayCheck.Checked ? "1" : "0";
                 d["tgEnabled"] = tgCheck.Checked ? "1" : "0";
                 d["ytEnabled"] = ytCheck.Checked ? "1" : "0";
+                d["secureDns"] = secureDnsCheck.Checked ? "1" : "0";
                 d["wasRunning"] = IsRunning ? "1" : "0";
                 Core.SaveIni(d);
             }
@@ -2614,7 +3284,7 @@ namespace ZapretGUI
                     "Служба WinDivert: " + StateRu(divert) + "\n" +
                     "Процесс winws.exe: " + (winws ? "запущен" : "не запущен") + "\n" +
                     "TCP timestamps: " + (ts ? "включены" : "выключены") + "\n" +
-                    "Base Filtering Engine (BFE): " + StateRu(bfe);
+                    "Base Filtering Engine (BFE): " + StateRu(bfe) + "\n" + SecureDns.StatusText();
                 string mode = IpsetMode();
                 int fakeCount = ReadFakes();
                 main.UiPost(delegate
