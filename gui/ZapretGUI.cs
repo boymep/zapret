@@ -5,10 +5,15 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -375,19 +380,14 @@ namespace ZapretGUI
             }
         }
 
-        // ---------- Telegram through a local tg-ws-proxy (Flowseal/tg-ws-proxy, MTProto) ----------
+        // ---------- Telegram through the built-in MTProto proxy (see TgWsProxy) ----------
 
-        public const string TgProxyVersion = "1.11.2";
-        public const string TgProxyUrl = "https://github.com/Flowseal/tg-ws-proxy/releases/download/v" + TgProxyVersion + "/TgWsProxy_windows.exe";
-        public const string TgProxySha256 = "54acaa989858dd0f90eca3d18a93125fac3d8f702fc25cff8900d6098f725853";
         public const string TgProxyHost = "127.0.0.1";
         public const int TgProxyPort = 1443;
-        const string TgProxyRunValue = "TgWsProxy"; // its own HKCU Run value name (APP_NAME)
 
+        // Folder of the external TgWsProxy.exe used by 1.10.3.6; removed on proxy start and in --cleanup.
         public static string TgProxyDir { get { return Path.Combine(BinDir, "tg-ws-proxy"); } }
         public static string TgProxyExe { get { return Path.Combine(TgProxyDir, "TgWsProxy.exe"); } }
-        // An existing TgWsProxy_data folder next to the exe switches the proxy to portable mode: config, markers and logs stay here, %APPDATA% is not touched.
-        public static string TgProxyDataDir { get { return Path.Combine(TgProxyDir, "TgWsProxy_data"); } }
 
         public static bool IsTgSecret(string s)
         {
@@ -403,119 +403,20 @@ namespace ZapretGUI
             return sb.ToString();
         }
 
-        // "dd" prefix = padded intermediate mode, the same link the proxy itself builds.
+        public static byte[] HexBytes(string hex)
+        {
+            byte[] b = new byte[hex.Length / 2];
+            for (int i = 0; i < b.Length; i++) b[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return b;
+        }
+
+        // "dd" prefix = padded intermediate mode, the same link tg-ws-proxy builds.
         public static string TgProxyLink(string secret)
         {
             return "tg://proxy?server=" + TgProxyHost + "&port=" + TgProxyPort + "&secret=dd" + secret;
         }
 
-        static string FileSha256(string path)
-        {
-            using (FileStream f = File.OpenRead(path))
-            using (SHA256 sha = SHA256.Create())
-            {
-                StringBuilder sb = new StringBuilder();
-                foreach (byte x in sha.ComputeHash(f)) sb.Append(x.ToString("x2"));
-                return sb.ToString();
-            }
-        }
-
-        // Makes sure the pinned proxy exe is present: downloads it on first use, checks SHA256. false on error.
-        public static bool EnsureTgProxyExe(Action<string> log)
-        {
-            string exe = TgProxyExe;
-            if (File.Exists(exe))
-            {
-                if (FileSha256(exe) == TgProxySha256) return true;
-                log("tg-ws-proxy: контрольная сумма не совпадает, файл будет скачан заново.");
-                File.Delete(exe);
-            }
-            log("tg-ws-proxy: загрузка v" + TgProxyVersion + "...");
-            byte[] data = Download(TgProxyUrl, 120000, 64L * 1024 * 1024);
-            string hash;
-            using (SHA256 sha = SHA256.Create())
-            {
-                StringBuilder sb = new StringBuilder();
-                foreach (byte x in sha.ComputeHash(data)) sb.Append(x.ToString("x2"));
-                hash = sb.ToString();
-            }
-            if (hash != TgProxySha256)
-            {
-                log("Ошибка: tg-ws-proxy не прошёл проверку SHA256 (получено " + hash + "), файл не сохранён.");
-                return false;
-            }
-            Directory.CreateDirectory(TgProxyDir);
-            string tmp = exe + ".part";
-            File.WriteAllBytes(tmp, data);
-            if (File.Exists(exe)) File.Delete(exe);
-            File.Move(tmp, exe);
-            log("tg-ws-proxy: загружен, SHA256 совпадает.");
-            return true;
-        }
-
-        // Writes TgWsProxy_data\config.json: our host/port/secret, autostart and update checks off, other keys kept or defaulted.
-        public static void WriteTgProxyConfig(string secret)
-        {
-            string dir = TgProxyDataDir;
-            Directory.CreateDirectory(dir);
-            string path = Path.Combine(dir, "config.json");
-            System.Web.Script.Serialization.JavaScriptSerializer js = new System.Web.Script.Serialization.JavaScriptSerializer();
-            Dictionary<string, object> cfg = null;
-            try { if (File.Exists(path)) cfg = js.Deserialize<Dictionary<string, object>>(File.ReadAllText(path, Encoding.UTF8)); }
-            catch (Exception) { cfg = null; }
-            if (cfg == null)
-            {
-                cfg = new Dictionary<string, object>();
-                cfg["dc_ip"] = new string[] { "2:149.154.167.220", "4:149.154.167.220" };
-                cfg["verbose"] = false;
-                cfg["log_max_mb"] = 5;
-                cfg["buf_kb"] = 256;
-                cfg["pool_size"] = 4;
-                cfg["cfproxy"] = true;
-                cfg["h2"] = true;
-                cfg["cfproxy_user_domain_enabled"] = false;
-                cfg["cfproxy_user_domain"] = new string[0];
-                cfg["cfproxy_worker_enabled"] = false;
-                cfg["cfproxy_worker_domain"] = new string[0];
-                cfg["force_test_dc"] = false;
-                cfg["no_secure"] = false;
-                cfg["appearance"] = "auto";
-                cfg["language"] = "ru";
-            }
-            cfg["host"] = TgProxyHost;
-            cfg["port"] = TgProxyPort;
-            cfg["secret"] = secret;
-            cfg["autostart"] = false;
-            cfg["check_updates"] = false; // the version is pinned by ZapretGUI
-            File.WriteAllText(path, js.Serialize(cfg), new UTF8Encoding(false));
-            // Markers that suppress the first-run and IPv6 dialogs.
-            foreach (string m in new string[] { ".first_run_done_mtproto", ".ipv6_warned" })
-            {
-                string mp = Path.Combine(dir, m);
-                if (!File.Exists(mp)) File.WriteAllText(mp, "");
-            }
-        }
-
-        // Removes the proxy's own HKCU Run autostart if it points to our copy.
-        public static void RemoveTgProxyAutostart(Action<string> log)
-        {
-            try
-            {
-                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
-                {
-                    if (k == null) return;
-                    string v = k.GetValue(TgProxyRunValue) as string;
-                    if (v != null && v.IndexOf(TgProxyExe, StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        k.DeleteValue(TgProxyRunValue, false);
-                        log("tg-ws-proxy: автозапуск прокси удалён.");
-                    }
-                }
-            }
-            catch (Exception ex) { log("tg-ws-proxy: не удалось проверить автозапуск: " + ex.Message); }
-        }
-
-        // Kills every process started from our TgWsProxy.exe (the PyInstaller exe runs as a parent and a child). false if any survived.
+        // Kills every process started from the old bin\tg-ws-proxy\TgWsProxy.exe. false if any survived.
         public static bool KillTgProxy(Action<string> log)
         {
             bool ok = true;
@@ -529,30 +430,26 @@ namespace ZapretGUI
                     if (path == null || !string.Equals(Path.GetFullPath(path), exe, StringComparison.OrdinalIgnoreCase)) continue;
                     p.Kill();
                     p.WaitForExit(3000);
-                    log("tg-ws-proxy остановлен (PID " + p.Id + ").");
+                    log("Старый tg-ws-proxy остановлен (PID " + p.Id + ").");
                 }
-                catch (Exception ex) { ok = false; log("Не удалось завершить tg-ws-proxy: " + ex.Message); }
+                catch (Exception ex) { ok = false; log("Не удалось завершить старый tg-ws-proxy: " + ex.Message); }
                 finally { p.Dispose(); }
             }
             return ok;
         }
 
-        // A TgWsProxy.exe started from another path (the user's own copy) holds its single-instance mutex and usually port 1443.
-        public static bool ForeignTgProxyRunning()
+        // Leftovers of 1.10.3.6: the external proxy process and its folder. false on error.
+        public static bool CleanupOldTgProxy(Action<string> log)
         {
-            string exe = Path.GetFullPath(TgProxyExe);
-            foreach (Process p in Process.GetProcessesByName("TgWsProxy"))
+            if (!Directory.Exists(TgProxyDir)) return true;
+            bool ok = KillTgProxy(log);
+            try
             {
-                try
-                {
-                    string path = null;
-                    try { path = p.MainModule.FileName; } catch (Exception) { }
-                    if (path == null || !string.Equals(Path.GetFullPath(path), exe, StringComparison.OrdinalIgnoreCase)) return true;
-                }
-                catch (Exception) { }
-                finally { p.Dispose(); }
+                Directory.Delete(TgProxyDir, true);
+                log("Удалена папка старого tg-ws-proxy: " + TgProxyDir);
             }
-            return false;
+            catch (Exception ex) { ok = false; log("Не удалось удалить " + TgProxyDir + ": " + ex.Message); }
+            return ok;
         }
 
         public static bool TgProxyPortBusy()
@@ -563,21 +460,6 @@ namespace ZapretGUI
                     if (ep.Port == TgProxyPort) return true;
             }
             catch (Exception) { }
-            return false;
-        }
-
-        public static bool TgProxyRunning()
-        {
-            string exe = Path.GetFullPath(TgProxyExe);
-            foreach (Process p in Process.GetProcessesByName("TgWsProxy"))
-            {
-                try
-                {
-                    if (!p.HasExited && string.Equals(Path.GetFullPath(p.MainModule.FileName), exe, StringComparison.OrdinalIgnoreCase)) return true;
-                }
-                catch (Exception) { }
-                finally { p.Dispose(); }
-            }
             return false;
         }
 
@@ -1787,7 +1669,7 @@ namespace ZapretGUI
         bool tgUp;
         readonly object tgLock = new object();
         readonly object tgProxyLock = new object();
-        Process tgProxy;            // the process we started (the PyInstaller parent)
+        TgWsProxy tgProxy;          // built-in Telegram proxy while it runs
         volatile bool tgProxyUp;
         string tgSecret;            // 32 hex chars, ZapretGUI.ini key tgSecret
         TabPage mainPage, servicePage, settingsPage;
@@ -1992,7 +1874,7 @@ namespace ZapretGUI
             });
         }
 
-        // ---------- Telegram through the local tg-ws-proxy ----------
+        // ---------- Telegram through the built-in proxy (TgWsProxy) ----------
 
         void OnTgCheckChanged(object sender, EventArgs e)
         {
@@ -2019,7 +1901,7 @@ namespace ZapretGUI
             ThreadPool.QueueUserWorkItem(delegate
             {
                 try { TgProxyStart(secret); }
-                catch (Exception ex) { Log("tg-ws-proxy: " + ex.Message); }
+                catch (Exception ex) { Log("Telegram-прокси: " + ex.Message); }
                 UiPost(delegate { UpdateUi(); });
             });
         }
@@ -2029,77 +1911,49 @@ namespace ZapretGUI
             ThreadPool.QueueUserWorkItem(delegate
             {
                 try { TgProxyStop(); }
-                catch (Exception ex) { Log("tg-ws-proxy: " + ex.Message); }
+                catch (Exception ex) { Log("Telegram-прокси: " + ex.Message); }
                 UiPost(delegate { UpdateUi(); });
             });
         }
 
-        // Any thread. Downloads the pinned exe if needed, writes its portable config and starts it.
+        // Any thread. Starts the built-in proxy (TgWsProxy) on 127.0.0.1:1443.
         void TgProxyStart(string secret)
         {
             lock (tgProxyLock)
             {
                 if (!tgWant || !IsRunning) return; // bypass or the option was switched off while this start was queued
-                if (tgProxy != null && !tgProxy.HasExited && Core.TgProxyRunning()) return; // e.g. strategy restart
-                if (File.Exists(Core.TgProxyExe)) Core.KillTgProxy(Log);
-                if (Core.ForeignTgProxyRunning())
-                {
-                    Log("tg-ws-proxy не запущен: уже работает другой TgWsProxy.exe. Закройте его или снимите опцию «Telegram через прокси».");
-                    return;
-                }
+                if (tgProxy != null) return;       // e.g. strategy restart
+                Core.CleanupOldTgProxy(Log);
                 if (Core.TgProxyPortBusy())
                 {
-                    Log("tg-ws-proxy не запущен: порт " + Core.TgProxyPort + " занят другой программой.");
+                    Log("Telegram-прокси не запущен: порт " + Core.TgProxyPort + " занят другой программой.");
                     return;
                 }
-                if (!Core.EnsureTgProxyExe(Log)) return;
-                Core.WriteTgProxyConfig(secret);
-                Core.RemoveTgProxyAutostart(Log);
-                ProcessStartInfo psi = new ProcessStartInfo(Core.TgProxyExe);
-                psi.WorkingDirectory = Core.TgProxyDir;
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                Process p = new Process();
-                p.StartInfo = psi;
-                p.EnableRaisingEvents = true;
-                p.Exited += delegate
+                TgWsProxy p = new TgWsProxy(Core.HexBytes(secret), Core.TgProxyPort, Log);
+                try { p.Start(); }
+                catch (Exception ex)
                 {
-                    if (p != tgProxy) return; // stopped by us or replaced
-                    tgProxyUp = false;
-                    int code = -1;
-                    try { code = p.ExitCode; } catch (Exception) { }
-                    Log("tg-ws-proxy завершился (код " + code + ").");
-                    UiPost(delegate { UpdateUi(); });
-                };
-                p.Start();
-                Thread.Sleep(2000);
-                if (!p.HasExited) tgProxy = p; // set after the check so the Exited handler does not log an early exit twice
-                if (p.HasExited)
-                {
-                    tgProxyUp = false;
-                    Log("tg-ws-proxy завершился сразу (код " + p.ExitCode + "). Возможно, уже запущен другой экземпляр TgWsProxy или занят порт " + Core.TgProxyPort + ".");
+                    p.Stop();
+                    Log("Telegram-прокси не запущен: " + ex.Message);
                     return;
                 }
+                tgProxy = p;
                 tgProxyUp = true;
-                Log("tg-ws-proxy запущен (PID " + p.Id + "), прокси " + Core.TgProxyHost + ":" + Core.TgProxyPort + ".");
+                Log("Telegram-прокси запущен: " + Core.TgProxyHost + ":" + Core.TgProxyPort + ".");
             }
         }
 
-        // Any thread. Stops our proxy (tracked PID plus any process started from our exe path).
+        // Any thread. Closes the listener and every open connection.
         void TgProxyStop()
         {
             lock (tgProxyLock)
             {
-                Process p = tgProxy;
+                TgWsProxy p = tgProxy;
                 tgProxy = null;
                 tgProxyUp = false;
-                if (p != null)
-                {
-                    try { if (!p.HasExited) { p.Kill(); p.WaitForExit(3000); } }
-                    catch (Exception) { }
-                    p.Dispose();
-                }
-                if (File.Exists(Core.TgProxyExe)) Core.KillTgProxy(Log);
+                if (p == null) return;
+                p.Stop();
+                Log("Telegram-прокси остановлен.");
             }
         }
 
@@ -2543,7 +2397,7 @@ ur.Margin = new Padding(0);            TableLayoutPanel top = NewStack();       
             ytCheck = NewCheck("YouTube через VPN");
             ytCheck.CheckedChanged += OnYtCheckChanged;
             CheckCard(t, secureDnsCheck, "Если YouTube не открывается с ошибкой DNS. Windows переключается на DNS через HTTPS (Cloudflare).");
-            TableLayoutPanel tgCard = CheckCard(t, tgCheck, "Трафик Telegram идёт через локальный прокси tg-ws-proxy. Он скачивается при первом включении. Чтобы добавить прокси в Telegram, нажмите «Подключить Telegram».");
+            TableLayoutPanel tgCard = CheckCard(t, tgCheck, "Трафик Telegram идёт через встроенный прокси: по WebSocket к серверам Telegram. Чтобы добавить прокси в Telegram, нажмите «Подключить Telegram».");
             Button tgLink = new Button();
             tgLink.AutoSize = true;
             tgLink.AutoSizeMode = AutoSizeMode.GrowAndShrink;
@@ -4409,6 +4263,1088 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
         }
     }
 
+    // ---------- built-in Telegram proxy: port of Flowseal/tg-ws-proxy v1.11.2 (proxy/tg_ws_proxy.py, bridge.py, pool.py, raw_websocket.py) ----------
+    // Telegram Desktop speaks obfuscated2 MTProto to 127.0.0.1:1443 (secret "dd..."); each connection is decrypted,
+    // re-encrypted with a fresh relay init and sent over WebSocket (wss://kwsN.web.telegram.org/apiws) to Telegram.
+    // Ported: handshake, DC/media/test-DC detection, relay init, AES-256-CTR re-encryption, packet splitting, WS pool
+    // (4 per DC, 120 s max age, backoff), SNI fronting retry, plain TCP fallback. Not ported: Cloudflare proxy/worker/H2 fallback, Fake TLS.
+
+    // AES-256-CTR with a 128-bit big-endian counter, built on AES-ECB.
+    sealed class AesCtr : IDisposable
+    {
+        readonly SymmetricAlgorithm aes;
+        readonly ICryptoTransform ecb;
+        readonly byte[] counter = new byte[16];
+        byte[] ks = new byte[0];
+        int ksPos;
+
+        public AesCtr(byte[] key, int keyOff, byte[] iv, int ivOff)
+        {
+            aes = new AesCryptoServiceProvider();
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.None;
+            byte[] k = new byte[32];
+            Buffer.BlockCopy(key, keyOff, k, 0, 32);
+            aes.Key = k;
+            ecb = aes.CreateEncryptor();
+            Buffer.BlockCopy(iv, ivOff, counter, 0, 16);
+        }
+
+        // XORs data in place with the key stream.
+        public void Apply(byte[] data, int off, int len)
+        {
+            int i = 0;
+            while (i < len)
+            {
+                if (ksPos >= ks.Length) Refill(len - i);
+                int n = Math.Min(len - i, ks.Length - ksPos);
+                for (int j = 0; j < n; j++) data[off + i + j] ^= ks[ksPos + j];
+                ksPos += n;
+                i += n;
+            }
+        }
+
+        void Refill(int need)
+        {
+            int blocks = Math.Max(1, Math.Min((need + 15) / 16, 4096));
+            byte[] ctrs = new byte[blocks * 16];
+            for (int b = 0; b < blocks; b++)
+            {
+                Buffer.BlockCopy(counter, 0, ctrs, b * 16, 16);
+                for (int c = 15; c >= 0; c--) { if (++counter[c] != 0) break; }
+            }
+            if (ks.Length != ctrs.Length) ks = new byte[ctrs.Length];
+            ecb.TransformBlock(ctrs, 0, ctrs.Length, ks, 0);
+            ksPos = 0;
+        }
+
+        public void Skip(int n) { Apply(new byte[n], 0, n); }
+
+        public void Dispose()
+        {
+            try { ecb.Dispose(); aes.Dispose(); } catch (Exception) { }
+        }
+    }
+
+    // Client WebSocket over a raw TLS stream: connects to a fixed IP with its own Host/SNI (raw_websocket.py).
+    sealed class RawWs
+    {
+        const int OpCont = 0x0, OpBinary = 0x2, OpClose = 0x8, OpPing = 0x9, OpPong = 0xA;
+        const int MaxMessage = 16 * 1024 * 1024;
+        static readonly RandomNumberGenerator Rng = new RNGCryptoServiceProvider();
+
+        readonly TcpClient tcp;
+        readonly Stream s;
+        readonly object wlock = new object();
+        readonly MemoryStream frag = new MemoryStream();
+        public readonly DateTime Created = DateTime.UtcNow;
+        volatile bool closed;
+
+        RawWs(TcpClient tcp, Stream s) { this.tcp = tcp; this.s = s; }
+
+        public bool Closed { get { return closed; } }
+
+        public static RawWs Connect(string ip, string domain, string path, string sni, int timeoutMs)
+        {
+            TcpClient tcp = new TcpClient(AddressFamily.InterNetwork);
+            try
+            {
+                IAsyncResult ar = tcp.BeginConnect(ip, 443, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, 10000))) throw new TimeoutException("TCP connect timeout");
+                tcp.EndConnect(ar);
+                TgWsProxy.SetSockOpts(tcp);
+                tcp.ReceiveTimeout = timeoutMs;
+                tcp.SendTimeout = timeoutMs;
+                bool fronted = sni != null;
+                // Fronting (sni set): chain is verified, the host name is not (create_ssl_context(check_hostname=False)).
+                SslStream ssl = new SslStream(tcp.GetStream(), false, delegate(object o, X509Certificate c, X509Chain ch, SslPolicyErrors e)
+                {
+                    if (e == SslPolicyErrors.None) return true;
+                    return fronted && e == SslPolicyErrors.RemoteCertificateNameMismatch;
+                });
+                ssl.AuthenticateAsClient(fronted ? sni : domain, null, (SslProtocols)3072, false); // TLS 1.2
+
+                byte[] keyRaw = new byte[16];
+                Rng.GetBytes(keyRaw);
+                string req = "GET " + path + " HTTP/1.1\r\n" +
+                    "Host: " + domain + "\r\n" +
+                    "Upgrade: websocket\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Sec-WebSocket-Key: " + Convert.ToBase64String(keyRaw) + "\r\n" +
+                    "Sec-WebSocket-Version: 13\r\n" +
+                    "Sec-WebSocket-Protocol: binary\r\n\r\n";
+                byte[] rb = Encoding.ASCII.GetBytes(req);
+                ssl.Write(rb, 0, rb.Length);
+                ssl.Flush();
+
+                string first = null;
+                while (true)
+                {
+                    string line = ReadLine(ssl);
+                    if (line == null || line.Length == 0) break;
+                    if (first == null) first = line;
+                }
+                if (first == null) throw new IOException("WS: пустой ответ");
+                string[] parts = first.Split(new char[] { ' ' }, 3);
+                int status = 0;
+                if (parts.Length >= 2) int.TryParse(parts[1], out status);
+                if (status != 101) throw new IOException("WS: HTTP " + first);
+                tcp.ReceiveTimeout = 0;
+                tcp.SendTimeout = 0;
+                return new RawWs(tcp, ssl);
+            }
+            catch (Exception)
+            {
+                try { tcp.Close(); } catch (Exception) { }
+                throw;
+            }
+        }
+
+        static string ReadLine(Stream st)
+        {
+            StringBuilder sb = new StringBuilder();
+            while (true)
+            {
+                int b = st.ReadByte();
+                if (b < 0) return sb.Length > 0 ? sb.ToString() : null;
+                if (b == '\n') return sb.ToString().TrimEnd('\r');
+                if (sb.Length > 8192) throw new IOException("WS: слишком длинный заголовок");
+                sb.Append((char)b);
+            }
+        }
+
+        static byte[] BuildFrame(int opcode, byte[] data, int off, int len)
+        {
+            int hl = 2 + (len < 126 ? 0 : (len < 65536 ? 2 : 8)) + 4;
+            byte[] f = new byte[hl + len];
+            f[0] = (byte)(0x80 | opcode);
+            int p = 2;
+            if (len < 126) f[1] = (byte)(0x80 | len);
+            else if (len < 65536) { f[1] = 0x80 | 126; f[2] = (byte)(len >> 8); f[3] = (byte)len; p = 4; }
+            else
+            {
+                f[1] = 0x80 | 127;
+                long l = len;
+                for (int i = 0; i < 8; i++) f[2 + i] = (byte)(l >> (56 - 8 * i));
+                p = 10;
+            }
+            byte[] mask = new byte[4];
+            Rng.GetBytes(mask);
+            Buffer.BlockCopy(mask, 0, f, p, 4);
+            p += 4;
+            for (int i = 0; i < len; i++) f[p + i] = (byte)(data[off + i] ^ mask[i & 3]);
+            return f;
+        }
+
+        void WriteRaw(byte[] f)
+        {
+            lock (wlock)
+            {
+                s.Write(f, 0, f.Length);
+                s.Flush();
+            }
+        }
+
+        public void Send(byte[] data)
+        {
+            if (closed) throw new IOException("WebSocket closed");
+            WriteRaw(BuildFrame(OpBinary, data, 0, data.Length));
+        }
+
+        public void SendBatch(List<byte[]> parts)
+        {
+            if (closed) throw new IOException("WebSocket closed");
+            if (parts.Count == 1) { Send(parts[0]); return; }
+            MemoryStream ms = new MemoryStream();
+            foreach (byte[] p in parts)
+            {
+                byte[] f = BuildFrame(OpBinary, p, 0, p.Length);
+                ms.Write(f, 0, f.Length);
+            }
+            WriteRaw(ms.ToArray());
+        }
+
+        void ReadExact(byte[] buf, int len)
+        {
+            int got = 0;
+            while (got < len)
+            {
+                int n = s.Read(buf, got, len - got);
+                if (n <= 0) throw new EndOfStreamException("WS: соединение закрыто");
+                got += n;
+            }
+        }
+
+        // Next complete message, or null when the server closed the WebSocket.
+        public byte[] Recv()
+        {
+            byte[] hdr = new byte[8];
+            while (!closed)
+            {
+                ReadExact(hdr, 2);
+                bool fin = (hdr[0] & 0x80) != 0;
+                int opcode = hdr[0] & 0x0F;
+                bool masked = (hdr[1] & 0x80) != 0;
+                long length = hdr[1] & 0x7F;
+                if (length == 126) { ReadExact(hdr, 2); length = (hdr[0] << 8) | hdr[1]; }
+                else if (length == 127)
+                {
+                    ReadExact(hdr, 8);
+                    length = 0;
+                    for (int i = 0; i < 8; i++) length = (length << 8) | hdr[i];
+                }
+                if (length > MaxMessage || length < 0) throw new IOException("WS: слишком большой кадр (" + length + ")");
+                byte[] mask = null;
+                if (masked) { mask = new byte[4]; ReadExact(mask, 4); }
+                byte[] payload = new byte[length];
+                ReadExact(payload, (int)length);
+                if (mask != null) for (int i = 0; i < payload.Length; i++) payload[i] ^= mask[i & 3];
+
+                if (opcode == OpClose)
+                {
+                    closed = true;
+                    try { WriteRaw(BuildFrame(OpClose, payload, 0, Math.Min(2, payload.Length))); } catch (Exception) { }
+                    return null;
+                }
+                if (opcode == OpPing)
+                {
+                    try { WriteRaw(BuildFrame(OpPong, payload, 0, payload.Length)); } catch (Exception) { }
+                    continue;
+                }
+                if (opcode == OpPong) continue;
+                if (opcode == OpCont || opcode == 0x1 || opcode == OpBinary)
+                {
+                    if (fin && frag.Length == 0) return payload;
+                    frag.Write(payload, 0, payload.Length);
+                    if (frag.Length > MaxMessage) throw new IOException("WS: слишком большое сообщение");
+                    if (!fin) continue;
+                    byte[] msg = frag.ToArray();
+                    frag.SetLength(0);
+                    return msg;
+                }
+            }
+            return null;
+        }
+
+        // Idle socket in the pool: too old, closed, or the server sent something / hung up.
+        public bool IsStale(DateTime now, double maxAgeSec)
+        {
+            if (closed || (now - Created).TotalSeconds >= maxAgeSec) return true;
+            try { return !tcp.Connected || tcp.Client.Poll(0, SelectMode.SelectRead); }
+            catch (Exception) { return true; }
+        }
+
+        public void Close()
+        {
+            if (!closed)
+            {
+                closed = true;
+                try { WriteRaw(BuildFrame(OpClose, new byte[0], 0, 0)); } catch (Exception) { }
+            }
+            try { tcp.Close(); } catch (Exception) { }
+        }
+    }
+
+    // Splits the re-encrypted client stream into MTProto transport packets, one WS frame each (bridge.py MsgSplitter).
+    sealed class MsgSplitter
+    {
+        readonly uint proto;
+        byte[] cbuf = new byte[0], pbuf = new byte[0];
+        int len;
+        bool disabled;
+
+        public MsgSplitter(uint proto) { this.proto = proto; }
+
+        public List<byte[]> Split(byte[] chunk, byte[] plain)
+        {
+            List<byte[]> parts = new List<byte[]>();
+            if (chunk.Length == 0) return parts;
+            if (disabled) { parts.Add(chunk); return parts; }
+            if (len + chunk.Length > cbuf.Length)
+            {
+                int cap = Math.Max(len + chunk.Length, cbuf.Length * 2);
+                Array.Resize(ref cbuf, cap);
+                Array.Resize(ref pbuf, cap);
+            }
+            Buffer.BlockCopy(chunk, 0, cbuf, len, chunk.Length);
+            Buffer.BlockCopy(plain, 0, pbuf, len, plain.Length);
+            len += chunk.Length;
+
+            int off = 0;
+            while (off < len)
+            {
+                int pl = NextPacketLen(off, len - off);
+                if (pl < 0) break;            // incomplete
+                if (pl == 0)                  // unknown framing: pass the rest through as is from now on
+                {
+                    parts.Add(Slice(off, len - off));
+                    off = len;
+                    disabled = true;
+                    break;
+                }
+                parts.Add(Slice(off, pl));
+                off += pl;
+            }
+            if (off > 0)
+            {
+                Buffer.BlockCopy(cbuf, off, cbuf, 0, len - off);
+                Buffer.BlockCopy(pbuf, off, pbuf, 0, len - off);
+                len -= off;
+            }
+            return parts;
+        }
+
+        public byte[] Flush()
+        {
+            if (len == 0) return null;
+            byte[] t = Slice(0, len);
+            len = 0;
+            return t;
+        }
+
+        byte[] Slice(int off, int n)
+        {
+            byte[] r = new byte[n];
+            Buffer.BlockCopy(cbuf, off, r, 0, n);
+            return r;
+        }
+
+        // -1 = need more data, 0 = cannot parse, otherwise the packet length.
+        int NextPacketLen(int off, int avail)
+        {
+            if (avail <= 0) return -1;
+            if (proto == TgWsProxy.ProtoAbridged)
+            {
+                int first = pbuf[off];
+                long payload;
+                int header;
+                if (first == 0x7F || first == 0xFF)
+                {
+                    if (avail < 4) return -1;
+                    payload = (pbuf[off + 1] | (pbuf[off + 2] << 8) | (pbuf[off + 3] << 16)) * 4L;
+                    header = 4;
+                }
+                else
+                {
+                    payload = (first & 0x7F) * 4L;
+                    header = 1;
+                }
+                if (payload <= 0) return 0;
+                long pl = header + payload;
+                if (pl > int.MaxValue) return 0;
+                return avail < pl ? -1 : (int)pl;
+            }
+            if (proto == TgWsProxy.ProtoIntermediate || proto == TgWsProxy.ProtoPadded)
+            {
+                if (avail < 4) return -1;
+                long payload = (uint)(pbuf[off] | (pbuf[off + 1] << 8) | (pbuf[off + 2] << 16) | (pbuf[off + 3] << 24)) & 0x7FFFFFFF;
+                if (payload <= 0) return 0;
+                long pl = 4 + payload;
+                if (pl > int.MaxValue) return 0;
+                return avail < pl ? -1 : (int)pl;
+            }
+            return 0;
+        }
+    }
+
+    sealed class TgWsProxy
+    {
+        public const uint ProtoAbridged = 0xEFEFEFEF, ProtoIntermediate = 0xEEEEEEEE, ProtoPadded = 0xDDDDDDDD;
+        const int HandshakeLen = 64, SkipLen = 8, PrekeyLen = 32, IvLen = 16, ProtoTagPos = 56, DcIdxPos = 60;
+        const int PoolSize = 4;
+        const double PoolMaxAge = 120.0;
+        const int BufSize = 256 * 1024;
+        const string WsPath = "/apiws", WsPathTest = "/apiws_test";
+        const string FrontingSni = "sprinthost.ru";
+
+        // config.py dc_redirects default: only DC2 and DC4 go over WS, the others use the fallback.
+        static readonly Dictionary<int, string> DcRedirects = new Dictionary<int, string> { { 2, "149.154.167.220" }, { 4, "149.154.167.220" } };
+        static readonly Dictionary<int, string> DcDefaultIps = new Dictionary<int, string>
+        {
+            { 1, "149.154.175.50" }, { 2, "149.154.167.51" }, { 3, "149.154.175.100" },
+            { 4, "149.154.167.91" }, { 5, "149.154.171.5" }, { 203, "91.105.192.100" }
+        };
+        static readonly Dictionary<int, string> DcTestIps = new Dictionary<int, string>
+        {
+            { 1, "149.154.175.10" }, { 2, "149.154.167.40" }, { 3, "149.154.175.117" }
+        };
+        static readonly RandomNumberGenerator Rng = new RNGCryptoServiceProvider();
+
+        readonly byte[] secret;
+        readonly int wantPort;
+        readonly Action<string> log;
+        TcpListener listener;
+        volatile bool stopping;
+        readonly ManualResetEvent stopEvt = new ManualResetEvent(false);
+        readonly object sync = new object();
+        readonly HashSet<TcpClient> clients = new HashSet<TcpClient>();
+        readonly HashSet<RawWs> sessions = new HashSet<RawWs>();
+
+        // pool state, guarded by sync; key = "dc|media|test"
+        readonly Dictionary<string, Queue<RawWs>> idle = new Dictionary<string, Queue<RawWs>>();
+        readonly HashSet<string> refilling = new HashSet<string>();
+        readonly Dictionary<string, int> refillFailures = new Dictionary<string, int>();
+        readonly Dictionary<string, DateTime> refillAfter = new Dictionary<string, DateTime>();
+        volatile bool tryFrontingFirst;
+
+        // tcp fallback backoff (bridge.py _tcp_failures), guarded by sync
+        readonly Dictionary<string, int> tcpFailures = new Dictionary<string, int>();
+        readonly Dictionary<string, DateTime> tcpRetryAfter = new Dictionary<string, DateTime>();
+        readonly HashSet<string> tcpConnecting = new HashSet<string>();
+
+        // log throttling: first connection of each kind is logged, the rest goes into the minute summary
+        readonly HashSet<string> seenRoutes = new HashSet<string>();
+        int statConn, statWs, statTcp, statFail, statBad;
+        DateTime nextStats = DateTime.UtcNow.AddSeconds(60);
+
+        public int Port { get; private set; }
+
+        public TgWsProxy(byte[] secret, int port, Action<string> log)
+        {
+            this.secret = secret;
+            this.wantPort = port;
+            this.log = log;
+        }
+
+        void L(string msg) { try { log("TG-прокси: " + msg); } catch (Exception) { } }
+
+        public static void SetSockOpts(TcpClient c)
+        {
+            try { c.NoDelay = true; } catch (Exception) { }
+            try { c.ReceiveBufferSize = BufSize; c.SendBufferSize = BufSize; } catch (Exception) { }
+        }
+
+        static string Key(int dc, bool media, bool test) { return dc + "|" + (media ? "1" : "0") + "|" + (test ? "1" : "0"); }
+
+        static string DcTag(int dc, bool media) { return "DC" + dc + (media ? " медиа" : ""); }
+
+        // Throws if the port cannot be bound.
+        public void Start()
+        {
+            listener = new TcpListener(IPAddress.Loopback, wantPort);
+            listener.Server.NoDelay = true;
+            listener.Start(128);
+            Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            Thread t = new Thread(AcceptLoop);
+            t.IsBackground = true;
+            t.Name = "tgproxy-accept";
+            t.Start();
+            Thread m = new Thread(Maintenance);
+            m.IsBackground = true;
+            m.Name = "tgproxy-pool";
+            m.Start();
+        }
+
+        public void Stop()
+        {
+            stopping = true;
+            stopEvt.Set();
+            try { if (listener != null) listener.Stop(); } catch (Exception) { }
+            List<TcpClient> cs;
+            List<RawWs> ws;
+            lock (sync)
+            {
+                cs = new List<TcpClient>(clients);
+                ws = new List<RawWs>(sessions);
+                foreach (Queue<RawWs> q in idle.Values) ws.AddRange(q);
+                clients.Clear();
+                sessions.Clear();
+                idle.Clear();
+            }
+            foreach (TcpClient c in cs) { try { c.Close(); } catch (Exception) { } }
+            foreach (RawWs w in ws) { try { w.Close(); } catch (Exception) { } }
+        }
+
+        void AcceptLoop()
+        {
+            while (!stopping)
+            {
+                TcpClient c;
+                try { c = listener.AcceptTcpClient(); }
+                catch (Exception ex)
+                {
+                    if (!stopping) L("ошибка приёма соединения: " + ex.Message);
+                    if (stopping) return;
+                    Thread.Sleep(1000);
+                    continue;
+                }
+                lock (sync)
+                {
+                    if (stopping) { try { c.Close(); } catch (Exception) { } return; }
+                    clients.Add(c);
+                    statConn++;
+                }
+                Thread t = new Thread(delegate() { HandleClient(c); });
+                t.IsBackground = true;
+                t.Start();
+            }
+        }
+
+        // ---- pool (pool.py _WsPool) ----
+
+        static List<string> WsDomains(int dc, bool media)
+        {
+            if (dc == 203) dc = 2;
+            List<string> d = new List<string>();
+            if (media) d.Add("kws" + dc + "-1.web.telegram.org");
+            d.Add("kws" + dc + ".web.telegram.org");
+            return d;
+        }
+
+        RawWs ConnectOne(string ip, List<string> domains, string path)
+        {
+            foreach (string domain in domains)
+            {
+                bool[] modes = tryFrontingFirst ? new bool[] { true, false } : new bool[] { false, true };
+                foreach (bool fronted in modes)
+                {
+                    if (stopping) return null;
+                    try
+                    {
+                        RawWs ws = RawWs.Connect(ip, domain, path, fronted ? FrontingSni : null, fronted ? 7000 : 8000);
+                        tryFrontingFirst = fronted;
+                        return ws;
+                    }
+                    catch (Exception) { }
+                }
+            }
+            return null;
+        }
+
+        RawWs PoolGet(int dc, bool media, bool test)
+        {
+            string ip;
+            if (!DcRedirects.TryGetValue(dc, out ip)) return null;
+            string key = Key(dc, media, test);
+            DateTime now = DateTime.UtcNow;
+            List<RawWs> stale = new List<RawWs>();
+            RawWs hit = null;
+            lock (sync)
+            {
+                Queue<RawWs> q;
+                if (!idle.TryGetValue(key, out q)) { q = new Queue<RawWs>(); idle[key] = q; }
+                while (q.Count > 0)
+                {
+                    RawWs w = q.Dequeue();
+                    if (w.IsStale(now, PoolMaxAge)) { stale.Add(w); continue; }
+                    hit = w;
+                    break;
+                }
+            }
+            foreach (RawWs w in stale) w.Close();
+            ScheduleRefill(dc, media, test);
+            return hit;
+        }
+
+        bool InBackoff(int dc, bool media, bool test)
+        {
+            DateTime after;
+            lock (sync) return refillAfter.TryGetValue(Key(dc, media, test), out after) && DateTime.UtcNow < after;
+        }
+
+        void ScheduleRefill(int dc, bool media, bool test)
+        {
+            string ip;
+            if (stopping || !DcRedirects.TryGetValue(dc, out ip)) return;
+            string key = Key(dc, media, test);
+            int needed;
+            lock (sync)
+            {
+                DateTime after;
+                if (refilling.Contains(key) || (refillAfter.TryGetValue(key, out after) && DateTime.UtcNow < after)) return;
+                Queue<RawWs> q;
+                if (!idle.TryGetValue(key, out q)) { q = new Queue<RawWs>(); idle[key] = q; }
+                needed = PoolSize - q.Count;
+                if (needed <= 0) return;
+                refilling.Add(key);
+            }
+            List<string> domains = WsDomains(dc, media);
+            string path = test ? WsPathTest : WsPath;
+            int pending = needed, connected = 0;
+            for (int i = 0; i < needed; i++)
+            {
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    RawWs ws = null;
+                    try { ws = ConnectOne(ip, domains, path); } catch (Exception) { }
+                    bool last;
+                    lock (sync)
+                    {
+                        if (ws != null)
+                        {
+                            Queue<RawWs> q;
+                            if (stopping || !idle.TryGetValue(key, out q)) { ws.Close(); ws = null; }
+                            else { q.Enqueue(ws); connected++; }
+                        }
+                        last = --pending == 0;
+                        if (last)
+                        {
+                            refilling.Remove(key);
+                            if (connected > 0)
+                            {
+                                int f;
+                                if (refillFailures.TryGetValue(key, out f) && !stopping) L(DcTag(dc, media) + ": связь с WebSocket восстановлена.");
+                                refillFailures.Remove(key);
+                                refillAfter.Remove(key);
+                            }
+                            else if (!stopping)
+                            {
+                                int f;
+                                refillFailures.TryGetValue(key, out f);
+                                f++;
+                                refillFailures[key] = f;
+                                double delay = Math.Min(1.0 * Math.Pow(2, Math.Min(f - 1, 12)), 3600.0);
+                                refillAfter[key] = DateTime.UtcNow.AddSeconds(delay);
+                                if (f == 1 || delay >= 60) L(DcTag(dc, media) + ": не удалось подключиться к " + domains[domains.Count - 1] + ", повтор через " + (int)delay + " с.");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Warmup plus the rotation loop: drops stale idle sockets and keeps each bucket filled.
+        void Maintenance()
+        {
+            foreach (int dc in DcRedirects.Keys)
+                foreach (bool media in new bool[] { false, true })
+                    ScheduleRefill(dc, media, false);
+            while (!stopEvt.WaitOne(5000))
+            {
+                DateTime now = DateTime.UtcNow;
+                List<RawWs> stale = new List<RawWs>();
+                List<string> keys;
+                lock (sync)
+                {
+                    foreach (Queue<RawWs> q in idle.Values)
+                    {
+                        int n = q.Count;
+                        for (int i = 0; i < n; i++)
+                        {
+                            RawWs w = q.Dequeue();
+                            if (w.IsStale(now, PoolMaxAge)) stale.Add(w); else q.Enqueue(w);
+                        }
+                    }
+                    keys = new List<string>(idle.Keys);
+                }
+                foreach (RawWs w in stale) w.Close();
+                foreach (string k in keys)
+                {
+                    string[] p = k.Split('|');
+                    ScheduleRefill(int.Parse(p[0]), p[1] == "1", p[2] == "1");
+                }
+                if (now >= nextStats)
+                {
+                    nextStats = now.AddSeconds(60);
+                    int c, w2, t, f, b;
+                    lock (sync)
+                    {
+                        c = statConn; w2 = statWs; t = statTcp; f = statFail; b = statBad;
+                        statConn = statWs = statTcp = statFail = statBad = 0;
+                    }
+                    if (c > 0)
+                        L("за минуту соединений: " + c + " (WS " + w2 + ", TCP " + t + (f > 0 ? ", без связи " + f : "") + (b > 0 ? ", неверный секрет " + b : "") + ").");
+                }
+            }
+        }
+
+        // ---- per-connection handling (tg_ws_proxy.py _handle_client) ----
+
+        static void ReadExact(Stream s, byte[] buf, int len)
+        {
+            int got = 0;
+            while (got < len)
+            {
+                int n = s.Read(buf, got, len - got);
+                if (n <= 0) throw new EndOfStreamException();
+                got += n;
+            }
+        }
+
+        static byte[] Sha256Of(byte[] a, int off, int len, byte[] b)
+        {
+            byte[] buf = new byte[len + b.Length];
+            Buffer.BlockCopy(a, off, buf, 0, len);
+            Buffer.BlockCopy(b, 0, buf, len, b.Length);
+            using (SHA256 sha = SHA256.Create()) return sha.ComputeHash(buf);
+        }
+
+        static uint ReadU32(byte[] b, int off) { return (uint)(b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)); }
+
+        // Random 64-byte init that cannot be mistaken for another protocol (utils.py RESERVED_*).
+        public static byte[] RandomInit()
+        {
+            byte[] r = new byte[HandshakeLen];
+            while (true)
+            {
+                Rng.GetBytes(r);
+                if (r[0] == 0xEF) continue;
+                uint start = (uint)((r[0] << 24) | (r[1] << 16) | (r[2] << 8) | r[3]);
+                if (start == 0x48454144 || start == 0x504F5354 || start == 0x47455420 || start == 0xEEEEEEEE ||
+                    start == 0xDDDDDDDD || start == 0x16030102 || start == 0x4F505449) continue;
+                if (r[4] == 0 && r[5] == 0 && r[6] == 0 && r[7] == 0) continue;
+                return r;
+            }
+        }
+
+        // _generate_relay_init: plain obfuscated2 init (no secret) with the client's proto tag and DC index.
+        static byte[] RelayInit(byte[] protoTag, int dcIdx)
+        {
+            byte[] rnd = RandomInit();
+            byte[] enc = (byte[])rnd.Clone();
+            using (AesCtr c = new AesCtr(rnd, SkipLen, rnd, SkipLen + PrekeyLen)) c.Apply(enc, 0, HandshakeLen);
+            byte[] tail = new byte[8];
+            Buffer.BlockCopy(protoTag, 0, tail, 0, 4);
+            tail[4] = (byte)(dcIdx & 0xFF);
+            tail[5] = (byte)((dcIdx >> 8) & 0xFF);
+            byte[] r2 = new byte[2];
+            Rng.GetBytes(r2);
+            tail[6] = r2[0];
+            tail[7] = r2[1];
+            byte[] result = (byte[])rnd.Clone();
+            for (int i = 0; i < 8; i++) result[ProtoTagPos + i] = (byte)(tail[i] ^ enc[ProtoTagPos + i] ^ rnd[ProtoTagPos + i]);
+            return result;
+        }
+
+        sealed class Ctx
+        {
+            public AesCtr CltDec, CltEnc, TgEnc, TgDec;
+            public void Dispose() { CltDec.Dispose(); CltEnc.Dispose(); TgEnc.Dispose(); TgDec.Dispose(); }
+        }
+
+        // _build_crypto_ctx
+        Ctx BuildCtx(byte[] hs, byte[] relay)
+        {
+            Ctx x = new Ctx();
+            x.CltDec = new AesCtr(Sha256Of(hs, SkipLen, PrekeyLen, secret), 0, hs, SkipLen + PrekeyLen);
+            byte[] rev = new byte[PrekeyLen + IvLen];
+            for (int i = 0; i < rev.Length; i++) rev[i] = hs[SkipLen + PrekeyLen + IvLen - 1 - i];
+            x.CltEnc = new AesCtr(Sha256Of(rev, 0, PrekeyLen, secret), 0, rev, PrekeyLen);
+            x.CltDec.Skip(HandshakeLen);
+
+            x.TgEnc = new AesCtr(relay, SkipLen, relay, SkipLen + PrekeyLen);
+            byte[] rrev = new byte[PrekeyLen + IvLen];
+            for (int i = 0; i < rrev.Length; i++) rrev[i] = relay[SkipLen + PrekeyLen + IvLen - 1 - i];
+            x.TgDec = new AesCtr(rrev, 0, rrev, PrekeyLen);
+            x.TgEnc.Skip(HandshakeLen);
+            return x;
+        }
+
+        void LogRouteOnce(string route, string text)
+        {
+            bool first;
+            lock (sync) first = seenRoutes.Add(route);
+            if (first) L(text);
+        }
+
+        void HandleClient(TcpClient c)
+        {
+            Ctx ctx = null;
+            try
+            {
+                SetSockOpts(c);
+                NetworkStream cs = c.GetStream();
+                byte[] hs = new byte[HandshakeLen];
+                c.ReceiveTimeout = 10000;
+                ReadExact(cs, hs, HandshakeLen);
+                c.ReceiveTimeout = 0;
+
+                // _try_handshake
+                byte[] dec = (byte[])hs.Clone();
+                using (AesCtr d = new AesCtr(Sha256Of(hs, SkipLen, PrekeyLen, secret), 0, hs, SkipLen + PrekeyLen)) d.Apply(dec, 0, HandshakeLen);
+                uint tag = ReadU32(dec, ProtoTagPos);
+                if (tag != ProtoAbridged && tag != ProtoIntermediate && tag != ProtoPadded)
+                {
+                    bool first;
+                    lock (sync) { statBad++; first = seenRoutes.Add("bad"); }
+                    if (first) L("неверное рукопожатие (другой секрет или протокол). Удалите прокси в Telegram и подключите заново.");
+                    byte[] sink = new byte[4096];
+                    while (cs.Read(sink, 0, sink.Length) > 0) { }
+                    return;
+                }
+                short dcIdx = (short)(dec[DcIdxPos] | (dec[DcIdxPos + 1] << 8));
+                int dc = Math.Abs((int)dcIdx);
+                bool media = dcIdx < 0;
+                bool test = dc >= 10000;
+                if (test) dc -= 10000;
+                byte[] protoTag = new byte[4];
+                Buffer.BlockCopy(dec, ProtoTagPos, protoTag, 0, 4);
+
+                byte[] relay = RelayInit(protoTag, media ? -dc : dc);
+                ctx = BuildCtx(hs, relay);
+
+                RawWs ws = PoolGet(dc, media, test);
+                if (ws == null && DcRedirects.ContainsKey(dc) && !InBackoff(dc, media, test))
+                    ws = ConnectOne(DcRedirects[dc], WsDomains(dc, media), test ? WsPathTest : WsPath); // pool miss: connect directly (upstream would try Cloudflare here)
+                if (ws == null)
+                {
+                    if (!TcpFallback(c, cs, relay, dc, media, test, ctx))
+                    {
+                        lock (sync) statFail++;
+                        LogRouteOnce("fail|" + dc + "|" + media, DcTag(dc, media) + (test ? " (тест)" : "") + ": нет пути к Telegram (WebSocket и TCP недоступны).");
+                    }
+                    return;
+                }
+                lock (sync)
+                {
+                    statWs++;
+                    if (stopping) { ws.Close(); return; }
+                    sessions.Add(ws);
+                }
+                LogRouteOnce("ws|" + dc + "|" + media, DcTag(dc, media) + (test ? " (тест)" : "") + " -> WebSocket.");
+                try
+                {
+                    ws.Send(relay);
+                    BridgeWs(c, cs, ws, ctx, new MsgSplitter(tag));
+                }
+                finally
+                {
+                    lock (sync) sessions.Remove(ws);
+                    ws.Close();
+                }
+            }
+            catch (Exception) { } // client gone, timeouts, shutdown: not worth a log line each
+            finally
+            {
+                lock (sync) clients.Remove(c);
+                try { c.Close(); } catch (Exception) { }
+                if (ctx != null) ctx.Dispose();
+            }
+        }
+
+        // bridge_ws_reencrypt: client -> decrypt -> encrypt -> WS frames; WS -> decrypt -> encrypt -> client.
+        void BridgeWs(TcpClient c, NetworkStream cs, RawWs ws, Ctx ctx, MsgSplitter splitter)
+        {
+            Thread up = new Thread(delegate()
+            {
+                try
+                {
+                    byte[] buf = new byte[65536];
+                    while (true)
+                    {
+                        int n = cs.Read(buf, 0, buf.Length);
+                        if (n <= 0)
+                        {
+                            byte[] tail = splitter.Flush();
+                            if (tail != null) ws.Send(tail);
+                            break;
+                        }
+                        byte[] plain = new byte[n];
+                        Buffer.BlockCopy(buf, 0, plain, 0, n);
+                        ctx.CltDec.Apply(plain, 0, n);
+                        byte[] chunk = (byte[])plain.Clone();
+                        ctx.TgEnc.Apply(chunk, 0, n);
+                        List<byte[]> parts = splitter.Split(chunk, plain);
+                        if (parts.Count > 0) ws.SendBatch(parts);
+                    }
+                }
+                catch (Exception) { }
+                ws.Close();
+                try { c.Close(); } catch (Exception) { }
+            });
+            up.IsBackground = true;
+            up.Start();
+            try
+            {
+                while (true)
+                {
+                    byte[] data = ws.Recv();
+                    if (data == null) break;
+                    ctx.TgDec.Apply(data, 0, data.Length);
+                    ctx.CltEnc.Apply(data, 0, data.Length);
+                    cs.Write(data, 0, data.Length);
+                }
+            }
+            catch (Exception) { }
+            ws.Close();
+            try { c.Close(); } catch (Exception) { }
+            up.Join(5000);
+        }
+
+        // _tcp_fallback: plain obfuscated2 straight to the DC on port 443, with backoff per address.
+        bool TcpFallback(TcpClient c, NetworkStream cs, byte[] relay, int dc, bool media, bool test, Ctx ctx)
+        {
+            string ip;
+            if (!(test ? DcTestIps : DcDefaultIps).TryGetValue(dc, out ip)) return false;
+            string key = ip + ":443";
+            lock (sync)
+            {
+                DateTime after;
+                if (tcpConnecting.Contains(key) || (tcpRetryAfter.TryGetValue(key, out after) && DateTime.UtcNow < after)) return false;
+                tcpConnecting.Add(key);
+            }
+            TcpClient r = new TcpClient(AddressFamily.InterNetwork);
+            try
+            {
+                try
+                {
+                    IAsyncResult ar = r.BeginConnect(ip, 443, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(10000)) throw new TimeoutException("timeout");
+                    r.EndConnect(ar);
+                    SetSockOpts(r);
+                    r.GetStream().Write(relay, 0, relay.Length);
+                }
+                catch (Exception ex)
+                {
+                    int f;
+                    double delay;
+                    lock (sync)
+                    {
+                        tcpConnecting.Remove(key);
+                        tcpFailures.TryGetValue(key, out f);
+                        f++;
+                        tcpFailures[key] = f;
+                        delay = Math.Min(30.0 * Math.Pow(2, Math.Min(f - 1, 7)), 3600.0);
+                        tcpRetryAfter[key] = DateTime.UtcNow.AddSeconds(delay);
+                    }
+                    L(DcTag(dc, media) + ": TCP к " + ip + " не удался (" + ex.Message + "), повтор через " + (int)delay + " с.");
+                    return false;
+                }
+                lock (sync)
+                {
+                    tcpConnecting.Remove(key);
+                    tcpFailures.Remove(key);
+                    tcpRetryAfter.Remove(key);
+                    statTcp++;
+                    if (stopping) return true;
+                    clients.Add(r);
+                }
+                LogRouteOnce("tcp|" + dc + "|" + media, DcTag(dc, media) + (test ? " (тест)" : "") + " -> TCP " + ip + ":443.");
+                NetworkStream rs = r.GetStream();
+                Thread up = new Thread(delegate()
+                {
+                    try
+                    {
+                        byte[] buf = new byte[65536];
+                        int n;
+                        while ((n = cs.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            ctx.CltDec.Apply(buf, 0, n);
+                            ctx.TgEnc.Apply(buf, 0, n);
+                            rs.Write(buf, 0, n);
+                        }
+                    }
+                    catch (Exception) { }
+                    try { r.Close(); } catch (Exception) { }
+                    try { c.Close(); } catch (Exception) { }
+                });
+                up.IsBackground = true;
+                up.Start();
+                try
+                {
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = rs.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        ctx.TgDec.Apply(buf, 0, n);
+                        ctx.CltEnc.Apply(buf, 0, n);
+                        cs.Write(buf, 0, n);
+                    }
+                }
+                catch (Exception) { }
+                try { r.Close(); } catch (Exception) { }
+                try { c.Close(); } catch (Exception) { }
+                up.Join(5000);
+                return true;
+            }
+            finally
+            {
+                lock (sync) clients.Remove(r);
+                try { r.Close(); } catch (Exception) { }
+            }
+        }
+
+        // ---- ZapretGUI.exe --tgproxy-selftest ----
+
+        // Runs the proxy on a free port with a random secret, connects to it as Telegram Desktop would (obfuscated2,
+        // dd secret, DC 2), sends an unencrypted req_pq_multi and expects resPQ (0x05162463). 0 = OK, 1 = FAIL.
+        public static int SelfTest(Action<string> outp)
+        {
+            byte[] secret = new byte[16];
+            Rng.GetBytes(secret);
+            TgWsProxy p = new TgWsProxy(secret, 0, outp);
+            Stopwatch sw = Stopwatch.StartNew();
+            try
+            {
+                p.Start();
+                outp("Прокси слушает 127.0.0.1:" + p.Port);
+                using (TcpClient c = new TcpClient())
+                {
+                    c.Connect(IPAddress.Loopback, p.Port);
+                    c.ReceiveTimeout = 40000;
+                    NetworkStream s = c.GetStream();
+
+                    byte[] hs = RandomInit();
+                    hs[56] = hs[57] = hs[58] = hs[59] = 0xDD; // padded intermediate
+                    hs[60] = 2; hs[61] = 0;                    // DC 2
+                    AesCtr enc = new AesCtr(Sha256Of(hs, SkipLen, PrekeyLen, secret), 0, hs, SkipLen + PrekeyLen);
+                    byte[] encHs = (byte[])hs.Clone();
+                    enc.Apply(encHs, 0, HandshakeLen);
+                    byte[] init = (byte[])hs.Clone();
+                    Buffer.BlockCopy(encHs, ProtoTagPos, init, ProtoTagPos, 8);
+                    byte[] rev = new byte[PrekeyLen + IvLen];
+                    for (int i = 0; i < rev.Length; i++) rev[i] = hs[SkipLen + PrekeyLen + IvLen - 1 - i];
+                    AesCtr dec = new AesCtr(Sha256Of(rev, 0, PrekeyLen, secret), 0, rev, PrekeyLen);
+                    s.Write(init, 0, init.Length);
+
+                    // unencrypted message: auth_key_id 0, msg_id, length 20, req_pq_multi#be7e8ef1 nonce:int128
+                    byte[] msg = new byte[40];
+                    TimeSpan now = DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                    long msgId = ((long)now.TotalSeconds << 32) | ((long)((now.TotalSeconds % 1) * 4294967296.0) & 0xFFFFFFFC);
+                    for (int i = 0; i < 8; i++) msg[8 + i] = (byte)(msgId >> (8 * i));
+                    msg[16] = 20;
+                    uint ctor = 0xbe7e8ef1;
+                    for (int i = 0; i < 4; i++) msg[20 + i] = (byte)(ctor >> (8 * i));
+                    byte[] nonce = new byte[16];
+                    Rng.GetBytes(nonce);
+                    Buffer.BlockCopy(nonce, 0, msg, 24, 16);
+                    byte[] padB = new byte[1];
+                    Rng.GetBytes(padB);
+                    int pad = padB[0] % 16;
+                    byte[] pkt = new byte[4 + msg.Length + pad];
+                    int plen = msg.Length + pad;
+                    for (int i = 0; i < 4; i++) pkt[i] = (byte)(plen >> (8 * i));
+                    Buffer.BlockCopy(msg, 0, pkt, 4, msg.Length);
+                    if (pad > 0) { byte[] pd = new byte[pad]; Rng.GetBytes(pd); Buffer.BlockCopy(pd, 0, pkt, 4 + msg.Length, pad); }
+                    enc.Apply(pkt, 0, pkt.Length);
+                    s.Write(pkt, 0, pkt.Length);
+
+                    byte[] lb = new byte[4];
+                    ReadExact(s, lb, 4);
+                    dec.Apply(lb, 0, 4);
+                    int rlen = (int)(ReadU32(lb, 0) & 0x7FFFFFFF);
+                    if (rlen < 24 || rlen > 65536) throw new IOException("неожиданная длина ответа " + rlen);
+                    byte[] resp = new byte[rlen];
+                    ReadExact(s, resp, rlen);
+                    dec.Apply(resp, 0, rlen);
+                    uint rc = ReadU32(resp, 20);
+                    bool authZero = true;
+                    for (int i = 0; i < 8; i++) if (resp[i] != 0) authZero = false;
+                    bool nonceOk = true;
+                    for (int i = 0; i < 16 && 24 + i < rlen; i++) if (resp[24 + i] != nonce[i]) nonceOk = false;
+                    enc.Dispose();
+                    dec.Dispose();
+                    if (authZero && rc == 0x05162463 && nonceOk)
+                    {
+                        outp("OK: resPQ от DC2 через WebSocket за " + sw.ElapsedMilliseconds + " мс (" + rlen + " байт).");
+                        return 0;
+                    }
+                    outp("FAIL: ответ не resPQ (конструктор 0x" + rc.ToString("x8") + ", nonce " + (nonceOk ? "совпал" : "не совпал") + ").");
+                    return 1;
+                }
+            }
+            catch (Exception ex)
+            {
+                outp("FAIL: " + ex.GetType().Name + ": " + ex.Message + " (" + sw.ElapsedMilliseconds + " мс)");
+                return 1;
+            }
+            finally
+            {
+                p.Stop();
+            }
+        }
+    }
+
     // ZapretGUI.exe --cleanup: headless removal of everything the GUI leaves on the system (used by unlocker.bat).
     // Does not touch the "zapret" Windows service (the bat handles it). Exit code 0 = ok, 1 = something failed.
     static class CleanupMode
@@ -4430,8 +5366,8 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             try { if (!Core.TgTeardown(L)) ok = false; }
             catch (Exception ex) { ok = false; L("Туннель: " + ex.Message); }
 
-            try { if (!Core.KillTgProxy(L)) ok = false; Core.RemoveTgProxyAutostart(L); }
-            catch (Exception ex) { ok = false; L("tg-ws-proxy: " + ex.Message); }
+            try { if (!Core.CleanupOldTgProxy(L)) ok = false; }
+            catch (Exception ex) { ok = false; L("Старый tg-ws-proxy: " + ex.Message); }
 
             try
             {
@@ -4497,6 +5433,8 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
 
             foreach (string a in argv)
                 if (a == "--cleanup") return CleanupMode.Run();
+            foreach (string a in argv)
+                if (a == "--tgproxy-selftest") return SelfTestMain();
 
             bool tray = false, afterUpdate = false, resume = false;
             int waitPid = 0;
@@ -4558,5 +5496,25 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
         }
 
         const string MutexNameStatic = "ZapretGUI_SingleInstance_Mutex";
+
+        [DllImport("kernel32.dll")]
+        static extern bool AttachConsole(int pid);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetStdHandle(int n);
+
+        // --tgproxy-selftest: checks the built-in Telegram proxy end to end, prints OK/FAIL, exit code 0/1. Changes nothing on the system.
+        static int SelfTestMain()
+        {
+            IntPtr h = GetStdHandle(-11);
+            if (h == IntPtr.Zero || h == new IntPtr(-1)) AttachConsole(-1); // started from cmd without redirection
+            Console.OutputEncoding = new UTF8Encoding(false);
+            int rc = TgWsProxy.SelfTest(delegate(string m)
+            {
+                lock (typeof(Program)) Console.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + m);
+            });
+            Console.Out.Flush();
+            return rc;
+        }
     }
 }
