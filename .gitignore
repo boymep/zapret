@@ -11,3 +11,4 @@
 /ZapretGUI.ini
 *.old
 /zapret-*.zip*
+/bin/tg-ws-proxy/

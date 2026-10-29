@@ -42,8 +42,10 @@ if exist "%ROOT%ZapretGUI.exe" (
     echo ZapretGUI.exe не найден, пропуск.
 )
 
-echo [3/5] Остановка winws и служб...
+echo [3/5] Остановка winws, tg-ws-proxy и служб...
 taskkill /F /IM winws.exe >nul 2>&1
+set "UL_ROOT=%ROOT%"
+powershell -NoProfile -Command "$p=Join-Path $env:UL_ROOT 'bin\tg-ws-proxy\TgWsProxy.exe'; Get-Process TgWsProxy -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $p } | Stop-Process -Force" >nul 2>&1
 call :remove_service zapret
 call :remove_service "AmneziaWGTunnel$zapret-tg"
 call :remove_service WinDivert
@@ -56,7 +58,7 @@ echo [5/5] Проверка блокировок файлов...
 timeout /t 2 /nobreak >nul
 set "UL_ROOT=%ROOT%"
 set "LOCKED="
-for /f "usebackq delims=" %%L in (`powershell -NoProfile -Command "$r=$env:UL_ROOT; foreach($f in 'bin\WinDivert64.sys','bin\winws.exe','ZapretGUI.exe'){$p=Join-Path $r $f; if(Test-Path -LiteralPath $p){try{$s=[IO.File]::Open($p,'Open','ReadWrite','None');$s.Close()}catch{$f}}}"`) do (
+for /f "usebackq delims=" %%L in (`powershell -NoProfile -Command "$r=$env:UL_ROOT; foreach($f in 'bin\WinDivert64.sys','bin\winws.exe','bin\tg-ws-proxy\TgWsProxy.exe','ZapretGUI.exe'){$p=Join-Path $r $f; if(Test-Path -LiteralPath $p){try{$s=[IO.File]::Open($p,'Open','ReadWrite','None');$s.Close()}catch{$f}}}"`) do (
     set "LOCKED=1"
     echo   Занят: %%L
 )

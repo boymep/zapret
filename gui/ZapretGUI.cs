@@ -248,7 +248,7 @@ namespace ZapretGUI
             {
                 if (RunAmnezia("/uninstalltunnelservice " + TgTunnelName, log) != null) ok = false;
                 for (int i = 0; i < 20 && ServiceState(TgServiceName) != null; i++) Thread.Sleep(250);
-                log("Туннель Telegram: отключён.");
+                log("Туннель VPN: отключён.");
             }
             try { if (File.Exists(TgConfPath)) File.Delete(TgConfPath); }
             catch (Exception) { ok = false; }
@@ -268,7 +268,7 @@ namespace ZapretGUI
             catch (Exception ex) { log("Ошибка удаления автозапуска: " + ex.Message); return false; }
         }
 
-        // ---------- Telegram split tunnel through AmneziaWG ----------
+        // ---------- YouTube / web Telegram split tunnel through AmneziaWG (name zapret-tg kept from older versions) ----------
 
         public const string TgTunnelName = "zapret-tg";
         public const string TgServiceName = "AmneziaWGTunnel$zapret-tg";
@@ -279,25 +279,6 @@ namespace ZapretGUI
             "149.154.160.0/20", "91.105.192.0/23", "91.108.20.0/22", "185.76.151.0/24",
             "2001:b28:f23d::/48", "2001:b28:f23f::/48", "2001:67c:4e8::/48", "2001:b28:f23c::/48", "2a0a:f280::/32"
         };
-
-        // Curated Google front-end ranges (cover youtube.com, googlevideo.com, ytimg.com front ends). Static, no network fetch.
-        public static readonly string[] YtCidrs =
-        {
-            "64.233.160.0/19", "66.102.0.0/20", "66.249.64.0/19", "72.14.192.0/18", "74.125.0.0/16",
-            "108.177.0.0/17", "142.250.0.0/15", "172.217.0.0/16", "172.253.0.0/16", "173.194.0.0/16",
-            "192.178.0.0/15", "209.85.128.0/17", "216.58.192.0/19", "216.239.32.0/19",
-            "2001:4860::/32", "2404:6800::/32", "2607:f8b0::/32", "2800:3f0::/32", "2a00:1450::/32", "2c0f:fb50::/32"
-        };
-
-        public static string AmneziaExe
-        {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AmneziaWG\\amneziawg.exe"); }
-        }
-
-        public static string TgConfPath
-        {
-            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ZapretGUI\\zapret-tg.conf"); }
-        }
 
         // Fresh list from telegram.org; falls back to the built-in one.
         public static string[] FetchTgCidrs(out bool fresh)
@@ -317,8 +298,26 @@ namespace ZapretGUI
             catch (Exception) { }
             return TgFallbackCidrs;
         }
+        // Curated Google front-end ranges (cover youtube.com, googlevideo.com, ytimg.com front ends). Static, no network fetch.
+        public static readonly string[] YtCidrs =
+        {
+            "64.233.160.0/19", "66.102.0.0/20", "66.249.64.0/19", "72.14.192.0/18", "74.125.0.0/16",
+            "108.177.0.0/17", "142.250.0.0/15", "172.217.0.0/16", "172.253.0.0/16", "173.194.0.0/16",
+            "192.178.0.0/15", "209.85.128.0/17", "216.58.192.0/19", "216.239.32.0/19",
+            "2001:4860::/32", "2404:6800::/32", "2607:f8b0::/32", "2800:3f0::/32", "2a00:1450::/32", "2c0f:fb50::/32"
+        };
 
-        // Keeps the source config verbatim except: [Peer] AllowedIPs becomes the Telegram CIDRs, DNS lines are dropped.
+        public static string AmneziaExe
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AmneziaWG\\amneziawg.exe"); }
+        }
+
+        public static string TgConfPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ZapretGUI\\zapret-tg.conf"); }
+        }
+
+        // Keeps the source config verbatim except: [Peer] AllowedIPs becomes the given CIDRs, DNS lines are dropped.
         public static bool HasEmbeddedTgConfig()
         {
             return System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceInfo("ZapretGUI.warp.conf") != null;
@@ -374,6 +373,212 @@ namespace ZapretGUI
                 byte[] b = new UTF8Encoding(false).GetBytes(content);
                 f.Write(b, 0, b.Length);
             }
+        }
+
+        // ---------- Telegram through a local tg-ws-proxy (Flowseal/tg-ws-proxy, MTProto) ----------
+
+        public const string TgProxyVersion = "1.11.2";
+        public const string TgProxyUrl = "https://github.com/Flowseal/tg-ws-proxy/releases/download/v" + TgProxyVersion + "/TgWsProxy_windows.exe";
+        public const string TgProxySha256 = "54acaa989858dd0f90eca3d18a93125fac3d8f702fc25cff8900d6098f725853";
+        public const string TgProxyHost = "127.0.0.1";
+        public const int TgProxyPort = 1443;
+        const string TgProxyRunValue = "TgWsProxy"; // its own HKCU Run value name (APP_NAME)
+
+        public static string TgProxyDir { get { return Path.Combine(BinDir, "tg-ws-proxy"); } }
+        public static string TgProxyExe { get { return Path.Combine(TgProxyDir, "TgWsProxy.exe"); } }
+        // An existing TgWsProxy_data folder next to the exe switches the proxy to portable mode: config, markers and logs stay here, %APPDATA% is not touched.
+        public static string TgProxyDataDir { get { return Path.Combine(TgProxyDir, "TgWsProxy_data"); } }
+
+        public static bool IsTgSecret(string s)
+        {
+            return s != null && Regex.IsMatch(s, "^[0-9a-f]{32}$");
+        }
+
+        public static string NewTgSecret()
+        {
+            byte[] b = new byte[16];
+            using (RNGCryptoServiceProvider rng = new RNGCryptoServiceProvider()) rng.GetBytes(b);
+            StringBuilder sb = new StringBuilder();
+            foreach (byte x in b) sb.Append(x.ToString("x2"));
+            return sb.ToString();
+        }
+
+        // "dd" prefix = padded intermediate mode, the same link the proxy itself builds.
+        public static string TgProxyLink(string secret)
+        {
+            return "tg://proxy?server=" + TgProxyHost + "&port=" + TgProxyPort + "&secret=dd" + secret;
+        }
+
+        static string FileSha256(string path)
+        {
+            using (FileStream f = File.OpenRead(path))
+            using (SHA256 sha = SHA256.Create())
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (byte x in sha.ComputeHash(f)) sb.Append(x.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
+        // Makes sure the pinned proxy exe is present: downloads it on first use, checks SHA256. false on error.
+        public static bool EnsureTgProxyExe(Action<string> log)
+        {
+            string exe = TgProxyExe;
+            if (File.Exists(exe))
+            {
+                if (FileSha256(exe) == TgProxySha256) return true;
+                log("tg-ws-proxy: контрольная сумма не совпадает, файл будет скачан заново.");
+                File.Delete(exe);
+            }
+            log("tg-ws-proxy: загрузка v" + TgProxyVersion + "...");
+            byte[] data = Download(TgProxyUrl, 120000, 64L * 1024 * 1024);
+            string hash;
+            using (SHA256 sha = SHA256.Create())
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (byte x in sha.ComputeHash(data)) sb.Append(x.ToString("x2"));
+                hash = sb.ToString();
+            }
+            if (hash != TgProxySha256)
+            {
+                log("Ошибка: tg-ws-proxy не прошёл проверку SHA256 (получено " + hash + "), файл не сохранён.");
+                return false;
+            }
+            Directory.CreateDirectory(TgProxyDir);
+            string tmp = exe + ".part";
+            File.WriteAllBytes(tmp, data);
+            if (File.Exists(exe)) File.Delete(exe);
+            File.Move(tmp, exe);
+            log("tg-ws-proxy: загружен, SHA256 совпадает.");
+            return true;
+        }
+
+        // Writes TgWsProxy_data\config.json: our host/port/secret, autostart and update checks off, other keys kept or defaulted.
+        public static void WriteTgProxyConfig(string secret)
+        {
+            string dir = TgProxyDataDir;
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, "config.json");
+            System.Web.Script.Serialization.JavaScriptSerializer js = new System.Web.Script.Serialization.JavaScriptSerializer();
+            Dictionary<string, object> cfg = null;
+            try { if (File.Exists(path)) cfg = js.Deserialize<Dictionary<string, object>>(File.ReadAllText(path, Encoding.UTF8)); }
+            catch (Exception) { cfg = null; }
+            if (cfg == null)
+            {
+                cfg = new Dictionary<string, object>();
+                cfg["dc_ip"] = new string[] { "2:149.154.167.220", "4:149.154.167.220" };
+                cfg["verbose"] = false;
+                cfg["log_max_mb"] = 5;
+                cfg["buf_kb"] = 256;
+                cfg["pool_size"] = 4;
+                cfg["cfproxy"] = true;
+                cfg["h2"] = true;
+                cfg["cfproxy_user_domain_enabled"] = false;
+                cfg["cfproxy_user_domain"] = new string[0];
+                cfg["cfproxy_worker_enabled"] = false;
+                cfg["cfproxy_worker_domain"] = new string[0];
+                cfg["force_test_dc"] = false;
+                cfg["no_secure"] = false;
+                cfg["appearance"] = "auto";
+                cfg["language"] = "ru";
+            }
+            cfg["host"] = TgProxyHost;
+            cfg["port"] = TgProxyPort;
+            cfg["secret"] = secret;
+            cfg["autostart"] = false;
+            cfg["check_updates"] = false; // the version is pinned by ZapretGUI
+            File.WriteAllText(path, js.Serialize(cfg), new UTF8Encoding(false));
+            // Markers that suppress the first-run and IPv6 dialogs.
+            foreach (string m in new string[] { ".first_run_done_mtproto", ".ipv6_warned" })
+            {
+                string mp = Path.Combine(dir, m);
+                if (!File.Exists(mp)) File.WriteAllText(mp, "");
+            }
+        }
+
+        // Removes the proxy's own HKCU Run autostart if it points to our copy.
+        public static void RemoveTgProxyAutostart(Action<string> log)
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (k == null) return;
+                    string v = k.GetValue(TgProxyRunValue) as string;
+                    if (v != null && v.IndexOf(TgProxyExe, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        k.DeleteValue(TgProxyRunValue, false);
+                        log("tg-ws-proxy: автозапуск прокси удалён.");
+                    }
+                }
+            }
+            catch (Exception ex) { log("tg-ws-proxy: не удалось проверить автозапуск: " + ex.Message); }
+        }
+
+        // Kills every process started from our TgWsProxy.exe (the PyInstaller exe runs as a parent and a child). false if any survived.
+        public static bool KillTgProxy(Action<string> log)
+        {
+            bool ok = true;
+            string exe = Path.GetFullPath(TgProxyExe);
+            foreach (Process p in Process.GetProcessesByName("TgWsProxy"))
+            {
+                try
+                {
+                    string path = null;
+                    try { path = p.MainModule.FileName; } catch (Exception) { }
+                    if (path == null || !string.Equals(Path.GetFullPath(path), exe, StringComparison.OrdinalIgnoreCase)) continue;
+                    p.Kill();
+                    p.WaitForExit(3000);
+                    log("tg-ws-proxy остановлен (PID " + p.Id + ").");
+                }
+                catch (Exception ex) { ok = false; log("Не удалось завершить tg-ws-proxy: " + ex.Message); }
+                finally { p.Dispose(); }
+            }
+            return ok;
+        }
+
+        // A TgWsProxy.exe started from another path (the user's own copy) holds its single-instance mutex and usually port 1443.
+        public static bool ForeignTgProxyRunning()
+        {
+            string exe = Path.GetFullPath(TgProxyExe);
+            foreach (Process p in Process.GetProcessesByName("TgWsProxy"))
+            {
+                try
+                {
+                    string path = null;
+                    try { path = p.MainModule.FileName; } catch (Exception) { }
+                    if (path == null || !string.Equals(Path.GetFullPath(path), exe, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch (Exception) { }
+                finally { p.Dispose(); }
+            }
+            return false;
+        }
+
+        public static bool TgProxyPortBusy()
+        {
+            try
+            {
+                foreach (System.Net.IPEndPoint ep in System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners())
+                    if (ep.Port == TgProxyPort) return true;
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        public static bool TgProxyRunning()
+        {
+            string exe = Path.GetFullPath(TgProxyExe);
+            foreach (Process p in Process.GetProcessesByName("TgWsProxy"))
+            {
+                try
+                {
+                    if (!p.HasExited && string.Equals(Path.GetFullPath(p.MainModule.FileName), exe, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch (Exception) { }
+                finally { p.Dispose(); }
+            }
+            return false;
         }
 
         // ---------- misc helpers ----------
@@ -1576,9 +1781,15 @@ namespace ZapretGUI
         ToolStripMenuItem trayTgItem;
         CheckBox ytCheck;
         ToolStripMenuItem trayYtItem;
-        volatile bool tgWant, ytWant;
+        volatile bool tgWant, ytWant, tgWebWant;
+        CheckBox tgWebCheck;
+        ToolStripMenuItem trayTgWebItem;
         bool tgUp;
         readonly object tgLock = new object();
+        readonly object tgProxyLock = new object();
+        Process tgProxy;            // the process we started (the PyInstaller parent)
+        volatile bool tgProxyUp;
+        string tgSecret;            // 32 hex chars, ZapretGUI.ini key tgSecret
         TabPage mainPage, servicePage, settingsPage;
         Label statusDot;
         CheckBox updatesCheck;
@@ -1722,6 +1933,7 @@ namespace ZapretGUI
                     SetUpdateText("Установка...");
                     UiInvoke(delegate { wasOn = IsRunning; StopBypass(); });
                     TgDown();
+                    TgProxyStop();
                     Updater.Apply(src, Core.Root, delegate(string s) { Log(s); });
                 }
                 catch (Exception ex) { err = ex.Message; }
@@ -1774,20 +1986,134 @@ namespace ZapretGUI
                     bool had = File.Exists(Warp.AccountPath);
                     lock (tgLock) { Warp.ResetAccount(); }
                     Log(had ? "WARP-аккаунт сброшен, новый будет создан при следующем включении VPN." : "Сохранённого WARP-аккаунта нет.");
-                    if (had && tgUp && (tgCheck.Checked || ytCheck.Checked) && IsRunning) { TgDown(); TgUp(); TgRefresh(); }
+                    if (had && tgUp && (ytWant || tgWebWant) && IsRunning) { TgDown(); TgUp(); TgRefresh(); }
                 }
                 catch (Exception ex) { Log("Не удалось сбросить WARP-аккаунт: " + ex.Message); }
             });
         }
 
-        // ---------- Telegram split tunnel (AmneziaWG) ----------
+        // ---------- Telegram through the local tg-ws-proxy ----------
 
         void OnTgCheckChanged(object sender, EventArgs e)
         {
             trayTgItem.Checked = tgCheck.Checked;
             tgWant = tgCheck.Checked;
-            OnVpnSelectionChanged();
+            if (loading) return;
+            SaveState();
+            if (tgCheck.Checked) { if (IsRunning) TgProxyStartAsync(); }
+            else TgProxyStopAsync();
         }
+
+        string TgSecret
+        {
+            get
+            {
+                if (!Core.IsTgSecret(tgSecret)) { tgSecret = Core.NewTgSecret(); SaveState(); }
+                return tgSecret;
+            }
+        }
+
+        void TgProxyStartAsync()
+        {
+            string secret = TgSecret; // UI thread: may save the ini
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { TgProxyStart(secret); }
+                catch (Exception ex) { Log("tg-ws-proxy: " + ex.Message); }
+                UiPost(delegate { UpdateUi(); });
+            });
+        }
+
+        void TgProxyStopAsync()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { TgProxyStop(); }
+                catch (Exception ex) { Log("tg-ws-proxy: " + ex.Message); }
+                UiPost(delegate { UpdateUi(); });
+            });
+        }
+
+        // Any thread. Downloads the pinned exe if needed, writes its portable config and starts it.
+        void TgProxyStart(string secret)
+        {
+            lock (tgProxyLock)
+            {
+                if (!tgWant || !IsRunning) return; // bypass or the option was switched off while this start was queued
+                if (tgProxy != null && !tgProxy.HasExited && Core.TgProxyRunning()) return; // e.g. strategy restart
+                if (File.Exists(Core.TgProxyExe)) Core.KillTgProxy(Log);
+                if (Core.ForeignTgProxyRunning())
+                {
+                    Log("tg-ws-proxy не запущен: уже работает другой TgWsProxy.exe. Закройте его или снимите опцию «Telegram через прокси».");
+                    return;
+                }
+                if (Core.TgProxyPortBusy())
+                {
+                    Log("tg-ws-proxy не запущен: порт " + Core.TgProxyPort + " занят другой программой.");
+                    return;
+                }
+                if (!Core.EnsureTgProxyExe(Log)) return;
+                Core.WriteTgProxyConfig(secret);
+                Core.RemoveTgProxyAutostart(Log);
+                ProcessStartInfo psi = new ProcessStartInfo(Core.TgProxyExe);
+                psi.WorkingDirectory = Core.TgProxyDir;
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                Process p = new Process();
+                p.StartInfo = psi;
+                p.EnableRaisingEvents = true;
+                p.Exited += delegate
+                {
+                    if (p != tgProxy) return; // stopped by us or replaced
+                    tgProxyUp = false;
+                    int code = -1;
+                    try { code = p.ExitCode; } catch (Exception) { }
+                    Log("tg-ws-proxy завершился (код " + code + ").");
+                    UiPost(delegate { UpdateUi(); });
+                };
+                p.Start();
+                Thread.Sleep(2000);
+                if (!p.HasExited) tgProxy = p; // set after the check so the Exited handler does not log an early exit twice
+                if (p.HasExited)
+                {
+                    tgProxyUp = false;
+                    Log("tg-ws-proxy завершился сразу (код " + p.ExitCode + "). Возможно, уже запущен другой экземпляр TgWsProxy или занят порт " + Core.TgProxyPort + ".");
+                    return;
+                }
+                tgProxyUp = true;
+                Log("tg-ws-proxy запущен (PID " + p.Id + "), прокси " + Core.TgProxyHost + ":" + Core.TgProxyPort + ".");
+            }
+        }
+
+        // Any thread. Stops our proxy (tracked PID plus any process started from our exe path).
+        void TgProxyStop()
+        {
+            lock (tgProxyLock)
+            {
+                Process p = tgProxy;
+                tgProxy = null;
+                tgProxyUp = false;
+                if (p != null)
+                {
+                    try { if (!p.HasExited) { p.Kill(); p.WaitForExit(3000); } }
+                    catch (Exception) { }
+                    p.Dispose();
+                }
+                if (File.Exists(Core.TgProxyExe)) Core.KillTgProxy(Log);
+            }
+        }
+
+        void OpenTelegramProxyLink()
+        {
+            try
+            {
+                if (!tgProxyUp) Log("Прокси Telegram сейчас не запущен: он работает, пока включён обход и отмечена опция «Telegram через прокси».");
+                Process.Start(Core.TgProxyLink(TgSecret));
+            }
+            catch (Exception ex) { Log("Не удалось открыть ссылку tg://proxy: " + ex.Message); }
+        }
+
+        // ---------- YouTube / web Telegram split tunnel (AmneziaWG) ----------
 
         void OnYtCheckChanged(object sender, EventArgs e)
         {
@@ -1796,15 +2122,19 @@ namespace ZapretGUI
             OnVpnSelectionChanged();
         }
 
-        // Either service toggled: rebuild the tunnel with the new set of ranges, or bring it down.
+        void OnTgWebCheckChanged(object sender, EventArgs e)
+        {
+            trayTgWebItem.Checked = tgWebCheck.Checked;
+            tgWebWant = tgWebCheck.Checked;
+            OnVpnSelectionChanged();
+        }
+
+        // YouTube or web Telegram toggled: rebuild the tunnel with the new set of ranges, or bring it down.
         void OnVpnSelectionChanged()
         {
             if (loading) return;
             SaveState();
-            if (tgCheck.Checked || ytCheck.Checked)
-            {
-                if (IsRunning) TgRestartAsync();
-            }
+            if (ytCheck.Checked || tgWebCheck.Checked) { if (IsRunning) TgRestartAsync(); }
             else TgDownAsync();
         }
 
@@ -1815,12 +2145,12 @@ namespace ZapretGUI
 
         void TgUpAsync()
         {
-            ThreadPool.QueueUserWorkItem(delegate { try { TgUp(); } catch (Exception ex) { Log("Туннель Telegram: " + ex.Message); } TgRefresh(); });
+            ThreadPool.QueueUserWorkItem(delegate { try { TgUp(); } catch (Exception ex) { Log("Туннель VPN: " + ex.Message); } TgRefresh(); });
         }
 
         void TgDownAsync()
         {
-            ThreadPool.QueueUserWorkItem(delegate { try { TgDown(); } catch (Exception ex) { Log("Туннель Telegram: " + ex.Message); } TgRefresh(); });
+            ThreadPool.QueueUserWorkItem(delegate { try { TgDown(); } catch (Exception ex) { Log("Туннель VPN: " + ex.Message); } TgRefresh(); });
         }
 
         void TgRefreshAsync()
@@ -1842,17 +2172,17 @@ namespace ZapretGUI
             UiPost(delegate
             {
                 tgUp = up;
-                if (!installed) { tgStatus.Text = "Туннель: AmneziaWG не установлен"; tgStatus.ForeColor = Color.Firebrick; }
-                else if (up) { tgStatus.Text = "Туннель: включён (" + TgServicesText() + ")"; tgStatus.ForeColor = Color.FromArgb(30, 130, 50); }
-                else { tgStatus.Text = "Туннель: отключён"; tgStatus.ForeColor = Color.DimGray; }
+                if (!installed) { tgStatus.Text = "VPN: AmneziaWG не установлен"; tgStatus.ForeColor = Color.Firebrick; }
+                else if (up) { tgStatus.Text = "VPN: " + VpnServicesText() + " — подключён"; tgStatus.ForeColor = Color.FromArgb(30, 130, 50); }
+                else { tgStatus.Text = "VPN: отключён"; tgStatus.ForeColor = Color.DimGray; }
                 UpdateUi();
             });
         }
 
-        string TgServicesText()
+        string VpnServicesText()
         {
-            string s = tgCheck.Checked ? "Telegram" : "";
-            if (ytCheck.Checked) s += (s.Length > 0 ? ", " : "") + "YouTube";
+            string s = ytCheck.Checked ? "YouTube" : "";
+            if (tgWebCheck.Checked) s += (s.Length > 0 ? ", " : "") + "Telegram (веб)";
             return s.Length > 0 ? s : "нет сервисов";
         }
 
@@ -1862,10 +2192,12 @@ namespace ZapretGUI
             return Core.RunAmnezia(args, Log);
         }
 
+        // Brings up the zapret-tg tunnel with the ranges of the selected services (YouTube/Google, Telegram for the web version).
         void TgUp()
         {
             lock (tgLock)
             {
+                if (!ytWant && !tgWebWant) return;
                 if (!File.Exists(Core.AmneziaExe)) { Log("AmneziaWG не найден: " + Core.AmneziaExe); return; }
                 string st = Core.ServiceState(Core.TgServiceName);
                 if (st == "RUNNING") return; // e.g. strategy restart: do not bounce the tunnel
@@ -1880,31 +2212,29 @@ namespace ZapretGUI
                         Log("Предупреждение: запущен другой VPN-туннель (" + m.Value + "). Возможен конфликт маршрутов.");
 
                 List<string> cidrList = new List<string>();
-                bool wantTg = tgWant, wantYt = ytWant;
-                if (wantTg)
+                if (tgWebWant)
                 {
                     bool fresh;
                     string[] tgc = Core.FetchTgCidrs(out fresh);
                     Log("Подсети Telegram: " + tgc.Length + (fresh ? " (telegram.org)" : " (встроенный список)"));
                     cidrList.AddRange(tgc);
                 }
-                if (wantYt)
+                if (ytWant)
                 {
                     Log("Подсети YouTube/Google: " + Core.YtCidrs.Length + " (встроенный список)");
                     foreach (string c in Core.YtCidrs) if (!cidrList.Contains(c)) cidrList.Add(c);
                 }
                 if (cidrList.Count == 0) return;
-                string[] cidrs = cidrList.ToArray();
-                string conf = Core.BuildTgConfig(src, cidrs);
+                string conf = Core.BuildTgConfig(src, cidrList.ToArray());
                 if (st != null) RunAmnezia("/uninstalltunnelservice " + Core.TgTunnelName);
                 Core.WriteTgConfigSecure(Core.TgConfPath, conf);
                 RunAmnezia("/installtunnelservice \"" + Core.TgConfPath + "\"");
                 for (int i = 0; i < 20; i++)
                 {
-                    if (Core.ServiceState(Core.TgServiceName) == "RUNNING") { Log("Туннель Telegram: подключён."); return; }
+                    if (Core.ServiceState(Core.TgServiceName) == "RUNNING") { Log("Туннель VPN: подключён."); return; }
                     Thread.Sleep(500);
                 }
-                Log("Туннель Telegram не запустился. Проверьте конфиг.");
+                Log("Туннель VPN не запустился. Проверьте конфиг.");
             }
         }
 
@@ -2011,8 +2341,7 @@ namespace ZapretGUI
 
         static readonly Color HintColor = Color.FromArgb(110, 115, 122);
         static readonly Color LineColor = Color.FromArgb(222, 226, 231);
-        static readonly Color CardColor = Color.FromArgb(243, 245, 248);
-        const int CardPad = 10;     // inner padding of a card
+        const int CardPad = 0;      // inner padding of a card (flat cards: none)
         const int Gap = 8;          // between consecutive cards and below headers
         const int SectionGap = 16;  // before a section header
         const int LineGap = 4;      // between lines inside a card
@@ -2094,7 +2423,7 @@ namespace ZapretGUI
             return false;
         }
 
-        // One setting card: full width, subtle background, identical padding.
+        // One setting card: full width, flat (no background, no inner padding).
         TableLayoutPanel NewCard(TableLayoutPanel stack)
         {
             TableLayoutPanel card = new TableLayoutPanel();
@@ -2102,7 +2431,6 @@ namespace ZapretGUI
             card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
             card.AutoSize = true;
             card.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            card.BackColor = CardColor;
             card.Padding = new Padding(CardPad);
             AddStack(stack, card, new Padding(0, 0, 0, Gap));
             return card;
@@ -2115,7 +2443,7 @@ namespace ZapretGUI
         }
 
         // Card with a check box (title = check box text) and a gray hint aligned with the caption.
-        void CheckCard(TableLayoutPanel stack, CheckBox c, string hint)
+        TableLayoutPanel CheckCard(TableLayoutPanel stack, CheckBox c, string hint)
         {
             TableLayoutPanel card = NewCard(stack);
             c.Margin = new Padding(0);
@@ -2123,6 +2451,7 @@ namespace ZapretGUI
             c.Font = new Font("Segoe UI Semibold", 9f);
             CardRow(card, c);
             CardRow(card, Hint(hint, CheckIndent));
+            return card;
         }
 
         // Card with title, control and hint stacked vertically.
@@ -2207,12 +2536,24 @@ ur.Margin = new Padding(0);            TableLayoutPanel top = NewStack();       
             dnsTip = new ToolTip();
             dnsTip.AutoPopDelay = 30000;
             dnsTip.SetToolTip(secureDnsCheck, "Провайдер может подменять DNS-ответы (например, для youtube.com). Включает DNS через HTTPS 1.1.1.1 для всей Windows. При выключении прежние настройки DNS восстанавливаются.");
-            tgCheck = NewCheck("Telegram через VPN");
+            tgCheck = NewCheck("Telegram через прокси");
             tgCheck.CheckedChanged += OnTgCheckChanged;
+            tgWebCheck = NewCheck("Веб-версия Telegram через VPN");
+            tgWebCheck.CheckedChanged += OnTgWebCheckChanged;
             ytCheck = NewCheck("YouTube через VPN");
             ytCheck.CheckedChanged += OnYtCheckChanged;
             CheckCard(t, secureDnsCheck, "Если YouTube не открывается с ошибкой DNS. Windows переключается на DNS через HTTPS (Cloudflare).");
-            CheckCard(t, tgCheck, "Трафик Telegram идёт через бесплатный Cloudflare WARP. Нужен AmneziaWG.");
+            TableLayoutPanel tgCard = CheckCard(t, tgCheck, "Трафик Telegram идёт через локальный прокси tg-ws-proxy. Он скачивается при первом включении. Чтобы добавить прокси в Telegram, нажмите «Подключить Telegram».");
+            Button tgLink = new Button();
+            tgLink.AutoSize = true;
+            tgLink.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            tgLink.Text = "Подключить Telegram";
+            tgLink.Padding = new Padding(6, 0, 6, 0);
+            tgLink.Margin = new Padding(CheckIndent, LineGap + 2, 0, 0);
+            tgLink.Anchor = AnchorStyles.Left;
+            tgLink.Click += delegate { OpenTelegramProxyLink(); };
+            CardRow(tgCard, tgLink);
+            CheckCard(t, tgWebCheck, "Для web.telegram.org в браузере. Адреса Telegram идут через WARP. Нужен AmneziaWG.");
             CheckCard(t, ytCheck, "Если zapret не справляется с YouTube. Скорость ограничена WARP.");
             tgStatus = new Label();
             tgStatus.AutoSize = true;
@@ -2372,10 +2713,17 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             trayMenu.Items.Add(show);
             trayMenu.Items.Add(trayToggleItem);
             trayMenu.Items.Add(trayStrategyMenu);
-            trayTgItem = new ToolStripMenuItem("Telegram через VPN");
+            trayTgItem = new ToolStripMenuItem("Telegram через прокси");
             trayTgItem.CheckOnClick = true;
             trayTgItem.Click += delegate { tgCheck.Checked = trayTgItem.Checked; };
             trayMenu.Items.Add(trayTgItem);
+            ToolStripMenuItem trayTgLink = new ToolStripMenuItem("Подключить Telegram");
+            trayTgLink.Click += delegate { OpenTelegramProxyLink(); };
+            trayMenu.Items.Add(trayTgLink);
+            trayTgWebItem = new ToolStripMenuItem("Веб-версия Telegram через VPN");
+            trayTgWebItem.CheckOnClick = true;
+            trayTgWebItem.Click += delegate { tgWebCheck.Checked = trayTgWebItem.Checked; };
+            trayMenu.Items.Add(trayTgWebItem);
             trayYtItem = new ToolStripMenuItem("YouTube через VPN");
             trayYtItem.CheckOnClick = true;
             trayYtItem.Click += delegate { ytCheck.Checked = trayYtItem.Checked; };
@@ -2483,6 +2831,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             SaveState();
             try { Stop(false); } catch (Exception) { }
             try { TgDown(); } catch (Exception) { }
+            try { TgProxyStop(); } catch (Exception) { }
             try { showEvent.Set(); } catch (Exception) { }
             tray.Visible = false;
             tray.Dispose();
@@ -2566,7 +2915,11 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             autoEnableCheck.Checked = GetBool(ini, "autoenable", false);
             trayCheck.Checked = GetBool(ini, "closeToTray", true);
             tgCheck.Checked = GetBool(ini, "tgEnabled", false);
+            string sec;
+            if (ini.TryGetValue("tgSecret", out sec) && Core.IsTgSecret(sec)) tgSecret = sec;
             ytCheck.Checked = GetBool(ini, "ytEnabled", false);
+            // Before 1.10.3.6 "tgEnabled" meant Telegram via WARP: keep the browser version working for those users.
+            tgWebCheck.Checked = ini.ContainsKey("tgWebEnabled") ? GetBool(ini, "tgWebEnabled", false) : GetBool(ini, "tgEnabled", false);
             secureDnsCheck.Checked = GetBool(ini, "secureDns", false);
             trayDnsItem.Checked = secureDnsCheck.Checked;
             checkUpdates = GetBool(ini, "check_updates", true); // default on; replaces the old utils\check_updates.enabled flag
@@ -2579,6 +2932,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             catch (Exception) { }
             trayTgItem.Checked = tgCheck.Checked;
             trayYtItem.Checked = ytCheck.Checked;
+            trayTgWebItem.Checked = tgWebCheck.Checked;
             autostartCheck.Checked = QueryTask();
 
             RebuildTrayStrategies();
@@ -2598,7 +2952,9 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
                 d["autoenable"] = autoEnableCheck.Checked ? "1" : "0";
                 d["closeToTray"] = trayCheck.Checked ? "1" : "0";
                 d["tgEnabled"] = tgCheck.Checked ? "1" : "0";
+                if (Core.IsTgSecret(tgSecret)) d["tgSecret"] = tgSecret;
                 d["ytEnabled"] = ytCheck.Checked ? "1" : "0";
+                d["tgWebEnabled"] = tgWebCheck.Checked ? "1" : "0";
                 d["secureDns"] = secureDnsCheck.Checked ? "1" : "0";
                 d["wasRunning"] = IsRunning ? "1" : "0";
                 Core.SaveIni(d);
@@ -2620,7 +2976,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             bool on = IsRunning;
             toggleButton.Text = on ? "ВЫКЛЮЧИТЬ" : "ВКЛЮЧИТЬ";
             toggleButton.BackColor = on ? Color.FromArgb(198, 40, 40) : Color.FromArgb(46, 125, 50);
-            statusLabel.Text = on ? "Обход включён — стратегия " + (current != null ? current.Display : "") + (tgUp ? " + VPN" : "") : "Обход выключен";
+            statusLabel.Text = on ? "Обход включён — стратегия " + (current != null ? current.Display : "") + (tgUp ? " + VPN" : "") + (tgProxyUp ? " + TG-прокси" : "") : "Обход выключен";
             statusDot.ForeColor = on ? Color.FromArgb(46, 160, 70) : Color.FromArgb(150, 150, 150);
             Icon ic = on ? iconOn : iconOff;
             Icon = ic;
@@ -2807,7 +3163,8 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
                 p.BeginErrorReadLine();
                 winws = p;
                 Log("Обход включён: " + current.Display + " (PID " + p.Id + ")");
-                if (tgCheck.Checked || ytCheck.Checked) TgUpAsync();
+                if (ytCheck.Checked || tgWebCheck.Checked) TgUpAsync();
+                if (tgCheck.Checked) TgProxyStartAsync();
             }
             catch (Exception ex)
             {
@@ -2837,7 +3194,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             }
             catch (Exception ex) { Log("Ошибка остановки: " + ex.Message); }
             winws = null;
-            if (!quiet && !exiting) TgDownAsync();
+            if (!quiet && !exiting) { TgDownAsync(); TgProxyStopAsync(); }
             if (!exiting)
             {
                 SaveState();
@@ -2860,6 +3217,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
                     winws = null;
                     Log("winws.exe завершился (код " + code + ")");
                     TgDownAsync();
+                    TgProxyStopAsync();
                     SaveState();
                     UpdateUi();
                     tray.ShowBalloonTip(5000, "Zapret GUI", "winws.exe завершился (код " + code + ")", ToolTipIcon.Warning);
@@ -4071,6 +4429,9 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
 
             try { if (!Core.TgTeardown(L)) ok = false; }
             catch (Exception ex) { ok = false; L("Туннель: " + ex.Message); }
+
+            try { if (!Core.KillTgProxy(L)) ok = false; Core.RemoveTgProxyAutostart(L); }
+            catch (Exception ex) { ok = false; L("tg-ws-proxy: " + ex.Message); }
 
             try
             {
