@@ -1623,9 +1623,6 @@ namespace ZapretGUI
         const string EventName = "ZapretGUI_ShowWindow_Event";
         const int MaxLogLength = 60000;
 
-        [DllImport("user32.dll")]
-        static extern bool DestroyIcon(IntPtr handle);
-
         readonly EventWaitHandle showEvent;
         readonly bool startInTray;
         bool allowVisible;
@@ -1653,7 +1650,7 @@ namespace ZapretGUI
         NotifyIcon tray;
         ContextMenuStrip trayMenu;
         ToolStripMenuItem trayToggleItem, trayStrategyMenu;
-        Icon iconOn, iconOff;
+        Icon iconOn, iconOff, trayOn, trayOff;
         TabControl tabs;
         TabPage listsPage;
         ListsTab listsTab;
@@ -2552,8 +2549,10 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
 
         void BuildTray()
         {
-            iconOn = MakeIcon(Color.FromArgb(46, 170, 70));
-            iconOff = MakeIcon(Color.FromArgb(140, 140, 140));
+            iconOn = AppIcons.Make(true);
+            iconOff = AppIcons.Make(false);
+            trayOn = AppIcons.MakeSmall(true);
+            trayOff = AppIcons.MakeSmall(false);
             Icon = iconOff;
 
             trayMenu = new ContextMenuStrip();
@@ -2591,29 +2590,10 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
 
             tray = new NotifyIcon();
             tray.ContextMenuStrip = trayMenu;
-            tray.Icon = iconOff;
+            tray.Icon = trayOff;
             tray.Text = "Обход: выключен";
             tray.Visible = true;
             tray.DoubleClick += delegate { ShowWindow(); };
-        }
-
-        static Icon MakeIcon(Color c)
-        {
-            using (Bitmap bmp = new Bitmap(32, 32))
-            {
-                using (Graphics g = Graphics.FromImage(bmp))
-                {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    using (Brush b = new SolidBrush(c)) g.FillEllipse(b, 2, 2, 28, 28);
-                    using (Pen p = new Pen(Color.FromArgb(90, 0, 0, 0), 1.5f)) g.DrawEllipse(p, 2, 2, 28, 28);
-                }
-                IntPtr h = bmp.GetHicon();
-                Icon tmp = Icon.FromHandle(h);
-                Icon copy = (Icon)tmp.Clone();
-                tmp.Dispose();
-                DestroyIcon(h);
-                return copy;
-            }
         }
 
         // ---------- window visibility ----------
@@ -2834,7 +2814,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             statusDot.ForeColor = on ? Color.FromArgb(46, 160, 70) : Color.FromArgb(150, 150, 150);
             Icon ic = on ? iconOn : iconOff;
             Icon = ic;
-            tray.Icon = ic;
+            tray.Icon = on ? trayOn : trayOff;
             tray.Text = on ? "Обход: включён" : "Обход: выключен";
             trayToggleItem.Text = on ? "Выключить обход" : "Включить обход";
             toggleButton.Enabled = !busy;
@@ -5424,6 +5404,141 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
         }
     }
 
+    // App icon: white "Z" on a rounded square, green = bypass on, gray = off. Each size is drawn separately
+    // (not scaled) and packed into an in-memory .ico, so Windows picks the exact size for the tray, title bar and taskbar.
+    static class AppIcons
+    {
+        public static readonly Color OnColor = Color.FromArgb(0x2E, 0xA0, 0x43);
+        public static readonly Color OffColor = Color.FromArgb(0x6E, 0x76, 0x81);
+        static readonly int[] Sizes = { 16, 20, 24, 32, 40, 48, 64 };
+
+        public static Bitmap Render(Color bg, int s)
+        {
+            Bitmap bmp = new Bitmap(s, s, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.Transparent);
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.Half; // integer coordinates = pixel edges, so the bars stay sharp
+                float r = s * 0.22f;
+                using (GraphicsPath p = new GraphicsPath())
+                {
+                    float d = r * 2;
+                    p.AddArc(0, 0, d, d, 180, 90);
+                    p.AddArc(s - d, 0, d, d, 270, 90);
+                    p.AddArc(s - d, s - d, d, d, 0, 90);
+                    p.AddArc(0, s - d, d, d, 90, 90);
+                    p.CloseFigure();
+                    using (Brush b = new SolidBrush(bg)) g.FillPath(b, p);
+                }
+                int inset = (int)Math.Round(s * 0.2);
+                int t = Math.Max(2, (int)Math.Round(s * 0.14)); // stroke thickness
+                float x0 = inset, x1 = s - inset, y0 = inset, y1 = s - inset;
+                float w = x1 - x0, h = (y1 - t) - (y0 + t);
+                float dx = (float)(t * Math.Sqrt(w * w + h * h) / h); // horizontal width of the diagonal for an even stroke
+                PointF[] z =
+                {
+                    new PointF(x0, y0), new PointF(x1, y0), new PointF(x1, y0 + t), new PointF(x0 + dx, y1 - t),
+                    new PointF(x1, y1 - t), new PointF(x1, y1), new PointF(x0, y1), new PointF(x0, y1 - t),
+                    new PointF(x1 - dx, y0 + t), new PointF(x0, y0 + t)
+                };
+                g.FillPolygon(Brushes.White, z);
+            }
+            return bmp;
+        }
+
+        // .ico with 32-bit BGRA DIB entries for every size.
+        public static byte[] BuildIco(Color bg)
+        {
+            List<byte[]> images = new List<byte[]>();
+            foreach (int s in Sizes)
+            {
+                using (Bitmap bmp = Render(bg, s))
+                using (MemoryStream ms = new MemoryStream())
+                using (BinaryWriter w = new BinaryWriter(ms))
+                {
+                    int maskRow = ((s + 31) / 32) * 4;
+                    w.Write(40); w.Write(s); w.Write(s * 2); w.Write((short)1); w.Write((short)32);
+                    w.Write(0); w.Write(s * s * 4 + maskRow * s); w.Write(0); w.Write(0); w.Write(0); w.Write(0);
+                    for (int y = s - 1; y >= 0; y--)
+                        for (int x = 0; x < s; x++)
+                        {
+                            Color c = bmp.GetPixel(x, y);
+                            w.Write(c.B); w.Write(c.G); w.Write(c.R); w.Write(c.A);
+                        }
+                    w.Write(new byte[maskRow * s]); // AND mask unused: alpha channel decides
+                    w.Flush();
+                    images.Add(ms.ToArray());
+                }
+            }
+            using (MemoryStream ms = new MemoryStream())
+            using (BinaryWriter w = new BinaryWriter(ms))
+            {
+                w.Write((short)0); w.Write((short)1); w.Write((short)images.Count);
+                int offset = 6 + 16 * images.Count;
+                for (int i = 0; i < images.Count; i++)
+                {
+                    int s = Sizes[i];
+                    w.Write((byte)(s >= 256 ? 0 : s)); w.Write((byte)(s >= 256 ? 0 : s)); w.Write((byte)0); w.Write((byte)0);
+                    w.Write((short)1); w.Write((short)32); w.Write(images[i].Length); w.Write(offset);
+                    offset += images[i].Length;
+                }
+                foreach (byte[] img in images) w.Write(img);
+                w.Flush();
+                return ms.ToArray();
+            }
+        }
+
+        // Multi-size icon (window / taskbar).
+        public static Icon Make(bool on)
+        {
+            return new Icon(new MemoryStream(BuildIco(on ? OnColor : OffColor)));
+        }
+
+        // Exact size for the notification area at the current DPI.
+        public static Icon MakeSmall(bool on)
+        {
+            return new Icon(new MemoryStream(BuildIco(on ? OnColor : OffColor)), SystemInformation.SmallIconSize);
+        }
+
+        // --icon-preview <dir>: PNGs of both states at 16/32/48 (taken back out of the .ico) and a 4x combined sheet.
+        public static int Preview(string dir)
+        {
+            Directory.CreateDirectory(dir);
+            int[] sizes = { 16, 32, 48 };
+            const int scale = 4, cell = 48 * scale + 24;
+            Color[] bgs = { Color.FromArgb(243, 243, 243), Color.FromArgb(32, 32, 32) };
+            using (Bitmap sheet = new Bitmap(cell * 6, cell * 2))
+            using (Graphics g = Graphics.FromImage(sheet))
+            {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                for (int row = 0; row < 2; row++)
+                {
+                    using (Brush b = new SolidBrush(bgs[row])) g.FillRectangle(b, 0, row * cell, cell * 6, cell);
+                    int col = 0;
+                    foreach (bool on in new bool[] { true, false })
+                    {
+                        byte[] ico = BuildIco(on ? OnColor : OffColor);
+                        foreach (int s in sizes)
+                        {
+                            using (Icon ic = new Icon(new MemoryStream(ico), s, s))
+                            using (Bitmap bmp = ic.ToBitmap())
+                            {
+                                if (row == 0) bmp.Save(Path.Combine(dir, "icon_" + (on ? "on" : "off") + "_" + s + ".png"), System.Drawing.Imaging.ImageFormat.Png);
+                                int x = col * cell + (cell - s * scale) / 2, y = row * cell + (cell - s * scale) / 2;
+                                g.DrawImage(bmp, new Rectangle(x, y, s * scale, s * scale));
+                            }
+                            col++;
+                        }
+                    }
+                }
+                sheet.Save(Path.Combine(dir, "icons_preview.png"), System.Drawing.Imaging.ImageFormat.Png);
+            }
+            return 0;
+        }
+    }
+
     static class Program
     {
         [STAThread]
@@ -5435,6 +5550,8 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
                 if (a == "--cleanup") return CleanupMode.Run();
             foreach (string a in argv)
                 if (a == "--tgproxy-selftest") return SelfTestMain();
+            for (int i = 0; i + 1 < argv.Length; i++)
+                if (argv[i] == "--icon-preview") return AppIcons.Preview(argv[i + 1]);
 
             bool tray = false, afterUpdate = false, resume = false;
             int waitPid = 0;
