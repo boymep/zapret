@@ -5447,12 +5447,37 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
             return bmp;
         }
 
-        // .ico with 32-bit BGRA DIB entries for every size.
+        // Sizes of gui\app.ico, the exe file icon (see --write-ico).
+        static readonly int[] FileIconSizes = { 16, 20, 24, 32, 40, 48, 64, 256 };
+
+        // --write-ico <path>: writes the exe file icon (active style). gui\app.ico in the repo is produced this way.
+        public static int WriteIco(string path)
+        {
+            File.WriteAllBytes(path, BuildIco(OnColor, FileIconSizes));
+            return 0;
+        }
+
         public static byte[] BuildIco(Color bg)
         {
+            return BuildIco(bg, Sizes);
+        }
+
+        // .ico with 32-bit BGRA DIB entries; 256 px entries are stored as PNG.
+        public static byte[] BuildIco(Color bg, int[] sizes)
+        {
             List<byte[]> images = new List<byte[]>();
-            foreach (int s in Sizes)
+            foreach (int s in sizes)
             {
+                if (s >= 256)
+                {
+                    using (Bitmap big = Render(bg, s))
+                    using (MemoryStream pm = new MemoryStream())
+                    {
+                        big.Save(pm, System.Drawing.Imaging.ImageFormat.Png);
+                        images.Add(pm.ToArray());
+                    }
+                    continue;
+                }
                 using (Bitmap bmp = Render(bg, s))
                 using (MemoryStream ms = new MemoryStream())
                 using (BinaryWriter w = new BinaryWriter(ms))
@@ -5478,7 +5503,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
                 int offset = 6 + 16 * images.Count;
                 for (int i = 0; i < images.Count; i++)
                 {
-                    int s = Sizes[i];
+                    int s = sizes[i];
                     w.Write((byte)(s >= 256 ? 0 : s)); w.Write((byte)(s >= 256 ? 0 : s)); w.Write((byte)0); w.Write((byte)0);
                     w.Write((short)1); w.Write((short)32); w.Write(images[i].Length); w.Write(offset);
                     offset += images[i].Length;
@@ -5552,6 +5577,7 @@ SectionHeader(t, "Обновления", SectionGap - Gap);            CheckCard
                 if (a == "--tgproxy-selftest") return SelfTestMain();
             for (int i = 0; i + 1 < argv.Length; i++)
                 if (argv[i] == "--icon-preview") return AppIcons.Preview(argv[i + 1]);
+                else if (argv[i] == "--write-ico") return AppIcons.WriteIco(argv[i + 1]);
 
             bool tray = false, afterUpdate = false, resume = false;
             int waitPid = 0;
